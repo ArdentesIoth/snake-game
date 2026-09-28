@@ -34,12 +34,15 @@ function App() {
   const [levelUp, setLevelUp] = useState(false);
   const [fps, setFps] = useState(15); // Dinamik FPS state
   
+  // Oyun state'i - smooth animasyon için genişletilmiş
   const gameStateRef = useRef({
     snake: [{ x: 0, y: 0 }],
+    previousSnake: [{ x: 0, y: 0 }], // Smooth animasyon için önceki pozisyonlar
     food: { x: 10, y: 10 },
     hamiltonianPath: [] as Point[],
     pathIndex: 0,
     hasEaten: false,
+    lastUpdateTime: 0, // Son mantık güncellemesinin zamanı (ms)
   });
 
   // FPS kontrol fonksiyonları
@@ -100,29 +103,32 @@ function App() {
     
     gameStateRef.current = {
       snake: [startPoint],
+      previousSnake: [startPoint], // Başlangıçta önceki pozisyon da aynı
       food: generateFood([startPoint]),
       hamiltonianPath,
       pathIndex: 0,
       hasEaten: false,
+      lastUpdateTime: performance.now(),
     };
   }, []);
 
-  // Oyun döngüsü - fps değiştiğinde otomatik güncellenir
+  // ========== OYUN MANTIĞI DÖNGÜSÜ (FPS bazlı) ==========
+  // Bu döngü sadece yılanın grid pozisyonunu günceller, çizim yapmaz
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const gameLoop = setInterval(() => {
+    const gameLogicInterval = setInterval(() => {
       const state = gameStateRef.current;
+      
+      // Önceki pozisyonları kaydet (smooth geçiş için)
+      state.previousSnake = state.snake.map(segment => ({ ...segment }));
+      
+      // Son güncelleme zamanını kaydet
+      state.lastUpdateTime = performance.now();
       
       // Hamiltonian yolu takip et
       state.pathIndex = (state.pathIndex + 1) % state.hamiltonianPath.length;
       const nextPosition = state.hamiltonianPath[state.pathIndex];
 
-      // Yılanı hareket ettir
+      // Yılanı hareket ettir (sadece grid pozisyonları)
       const newSnake = [nextPosition, ...state.snake];
       
       // Yem yendi mi kontrol et
@@ -140,16 +146,75 @@ function App() {
       }
 
       state.snake = newSnake;
+      
+      // previousSnake uzunluğunu snake ile senkronize et
+      // Yem yeme durumunda previousSnake'e yeni segment ekle
+      if (state.hasEaten) {
+        state.previousSnake = [...state.previousSnake, state.previousSnake[state.previousSnake.length - 1]];
+        state.hasEaten = false;
+      }
+      
+      // previousSnake çok uzunsa kırp
+      while (state.previousSnake.length > state.snake.length) {
+        state.previousSnake.pop();
+      }
+      
+      // previousSnake çok kısaysa genişlet
+      while (state.previousSnake.length < state.snake.length) {
+        state.previousSnake.push({ ...state.snake[state.snake.length - 1] });
+      }
+      
+    }, 1000 / fps);
 
-      // Çizim
-      drawGame(ctx, state);
-    }, 1000 / fps); // fps state'ini kullanıyor
+    return () => clearInterval(gameLogicInterval);
+  }, [fps]);
 
-    return () => clearInterval(gameLoop);
-  }, [fps]); // fps değiştiğinde useEffect yeniden çalışır
+  // ========== RENDER DÖNGÜSÜ (60 FPS requestAnimationFrame) ==========
+  // Bu döngü sadece ekrana çizer, oyun mantığına dokunmaz
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-  // Oyunu çiz
-  const drawGame = (ctx: CanvasRenderingContext2D, state: typeof gameStateRef.current) => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animationFrameId: number;
+    
+    const renderLoop = () => {
+      const state = gameStateRef.current;
+      const now = performance.now();
+      
+      // Son mantık güncellemesinden bu yana geçen süre
+      const timeSinceUpdate = now - state.lastUpdateTime;
+      
+      // Bir sonraki güncellemeye kadar geçmesi gereken süre
+      const updateInterval = 1000 / fps;
+      
+      // İnterpolasyon faktörü: 0 (tam önceki pozisyon) ile 1 (tam şimdiki pozisyon) arası
+      const interpolationFactor = Math.min(timeSinceUpdate / updateInterval, 1);
+      
+      // Oyunu çiz (smooth interpolasyon ile)
+      drawGame(ctx, state, interpolationFactor);
+      
+      // Bir sonraki frame'i planla
+      animationFrameId = requestAnimationFrame(renderLoop);
+    };
+    
+    // Render loop'u başlat
+    renderLoop();
+    
+    // Cleanup: component unmount olduğunda animasyonu durdur
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, [fps]); // fps değiştiğinde render loop yeniden başlar
+
+  // ========== ÇİZİM FONKSİYONU (Smooth Interpolation ile) ==========
+  const drawGame = (
+    ctx: CanvasRenderingContext2D, 
+    state: typeof gameStateRef.current,
+    interpolationFactor: number // 0-1 arası, pozisyonlar arası geçiş yüzdesi
+  ) => {
     // Gradient arka plan
     const gradient = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
     gradient.addColorStop(0, COLORS.background);
@@ -173,7 +238,7 @@ function App() {
       ctx.stroke();
     }
 
-    // Yem çiz (parlayan efekt)
+    // Yem çiz (parlayan efekt) - yem hareket etmediği için interpolasyon yok
     const foodX = state.food.x * CELL_SIZE;
     const foodY = state.food.y * CELL_SIZE;
     
@@ -192,11 +257,21 @@ function App() {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // Yılan çiz
+    // ========== YILAN ÇİZİMİ (SMOOTH INTERPOLATION) ==========
     state.snake.forEach((segment, index) => {
-      const x = segment.x * CELL_SIZE;
-      const y = segment.y * CELL_SIZE;
+      // Önceki pozisyonu al (eğer varsa)
+      const prevSegment = state.previousSnake[index] || segment;
+      
+      // Linear interpolation (lerp) ile yumuşak geçiş
+      // gerçekPozisyon = önceki + (şimdiki - önceki) * faktör
+      const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
+      const lerpY = prevSegment.y + (segment.y - prevSegment.y) * interpolationFactor;
+      
+      // Piksel koordinatlarına çevir
+      const x = lerpX * CELL_SIZE;
+      const y = lerpY * CELL_SIZE;
 
+      // Renk ve efekt ayarları
       if (index === 0) {
         // Baş - daha parlak
         ctx.fillStyle = COLORS.snakeHead;
@@ -211,12 +286,13 @@ function App() {
         ctx.shadowColor = COLORS.snake;
       }
 
-      // Yuvarlak köşeli dikdörtgen
+      // Yuvarlak köşeli dikdörtgen çiz
       const radius = 4;
       ctx.beginPath();
       ctx.roundRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2, radius);
       ctx.fill();
       
+      // Opacity ve shadow'u sıfırla
       ctx.globalAlpha = 1;
       ctx.shadowBlur = 0;
     });
@@ -349,6 +425,9 @@ function App() {
         </div>
         <div className="mt-4 text-center text-gray-400 text-xs">
           💡 Hamiltonian Cycle algoritması sayesinde yılan hiç ölmeden tüm ekranı doldurur
+        </div>
+        <div className="mt-2 text-center text-green-400 text-xs font-semibold">
+          ✨ Smooth animasyon: Oyun mantığı {fps} FPS, çizim 60 FPS
         </div>
       </div>
 
