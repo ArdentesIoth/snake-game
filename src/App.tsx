@@ -10,7 +10,11 @@ const GRID_HEIGHT = CANVAS_HEIGHT / CELL_SIZE; // 30
 // FPS limitleri
 const MIN_FPS = 1;
 const MAX_FPS = 60;
-const FPS_STEP = 5; // Her buton tıklamasında ne kadar değişecek
+const FPS_STEP = 5;
+
+// Oyun ayarları
+const DEATH_ANIMATION_DURATION = 1500; // Yanma efekti süresi (ms)
+const RESET_DELAY = 2000; // Yanma sonrası reset bekleme süresi (ms)
 
 // Renkler
 const COLORS = {
@@ -21,6 +25,8 @@ const COLORS = {
   food: '#ff0066',
   text: '#ffffff',
   scoreGlow: '#ffd700',
+  // Yanma efekti renkleri
+  fire: ['#ff0000', '#ff4500', '#ff6600', '#ff8800', '#ffaa00', '#ffdd00'],
 };
 
 interface Point {
@@ -28,55 +34,137 @@ interface Point {
   y: number;
 }
 
+// Parçacık sistemi için
+interface Particle {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number;
+  color: string;
+  size: number;
+}
+
+// Yön vektörleri (yukarı, sağ, aşağı, sol)
+const DIRECTIONS = [
+  { x: 0, y: -1 }, // Yukarı
+  { x: 1, y: 0 },  // Sağ
+  { x: 0, y: 1 },  // Aşağı
+  { x: -1, y: 0 }, // Sol
+];
+
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [score, setScore] = useState(0);
+  const [highScore, setHighScore] = useState(0);
+  const [gameCount, setGameCount] = useState(1);
   const [levelUp, setLevelUp] = useState(false);
-  const [fps, setFps] = useState(15); // Dinamik FPS state
+  const [fps, setFps] = useState(15);
   
-  // Oyun state'i - smooth animasyon için genişletilmiş
+  // Oyun state'i
   const gameStateRef = useRef({
-    snake: [{ x: 0, y: 0 }],
-    previousSnake: [{ x: 0, y: 0 }], // Smooth animasyon için önceki pozisyonlar
+    snake: [{ x: 20, y: 15 }],
+    previousSnake: [{ x: 20, y: 15 }],
     food: { x: 10, y: 10 },
-    hamiltonianPath: [] as Point[],
-    pathIndex: 0,
+    direction: { x: 1, y: 0 }, // Başlangıç yönü: sağa
     hasEaten: false,
-    lastUpdateTime: 0, // Son mantık güncellemesinin zamanı (ms)
+    lastUpdateTime: 0,
+    isGameOver: false,
+    deathTime: 0,
+    particles: [] as Particle[], // Yanma efekti parçacıkları
   });
 
-  // FPS kontrol fonksiyonları
-  const decreaseFps = () => {
-    setFps(prev => Math.max(MIN_FPS, prev - FPS_STEP));
-  };
+  // ============= BFS PATHFINDING ALGORİTMASI =============
+  // Yılan başından yeme giden en kısa yolu bulur
+  const findPathBFS = (start: Point, target: Point, obstacles: Point[]): Point[] => {
+    // Noktayı string'e çevir (hashmap için)
+    const pointToKey = (p: Point) => `${p.x},${p.y}`;
 
-  const increaseFps = () => {
-    setFps(prev => Math.min(MAX_FPS, prev + FPS_STEP));
-  };
+    // Engelleri bir Set'e çevir (hızlı arama için)
+    const obstacleSet = new Set(obstacles.map(pointToKey));
 
-  // Hamiltonian Cycle oluştur - Zigzag pattern
-  const createHamiltonianCycle = (): Point[] => {
-    const path: Point[] = [];
-    
-    // Zigzag pattern: Her satırda sağa git, sonra alta in, sola git, alta in...
-    for (let y = 0; y < GRID_HEIGHT; y++) {
-      if (y % 2 === 0) {
-        // Sağa git
-        for (let x = 0; x < GRID_WIDTH; x++) {
-          path.push({ x, y });
-        }
-      } else {
-        // Sola git
-        for (let x = GRID_WIDTH - 1; x >= 0; x--) {
-          path.push({ x, y });
+    // BFS için kuyruk ve ziyaret edilenler
+    const queue: { point: Point; path: Point[] }[] = [{ point: start, path: [start] }];
+    const visited = new Set<string>([pointToKey(start)]);
+
+    while (queue.length > 0) {
+      const { point, path } = queue.shift()!;
+
+      // Hedefe ulaştık mı?
+      if (point.x === target.x && point.y === target.y) {
+        return path;
+      }
+
+      // 4 yönü dene
+      for (const dir of DIRECTIONS) {
+        const nextPoint = { x: point.x + dir.x, y: point.y + dir.y };
+        const nextKey = pointToKey(nextPoint);
+
+        // Geçerli pozisyon mu kontrol et
+        if (
+          nextPoint.x >= 0 &&
+          nextPoint.x < GRID_WIDTH &&
+          nextPoint.y >= 0 &&
+          nextPoint.y < GRID_HEIGHT &&
+          !visited.has(nextKey) &&
+          !obstacleSet.has(nextKey)
+        ) {
+          visited.add(nextKey);
+          queue.push({
+            point: nextPoint,
+            path: [...path, nextPoint],
+          });
         }
       }
     }
-    
-    return path;
+
+    // Yol bulunamadı
+    return [];
   };
 
-  // Rastgele yem konumu oluştur
+  // ============= ÇARPIŞMA KONTROLÜ =============
+  const checkCollision = (head: Point, body: Point[]): boolean => {
+    // Duvara çarpma kontrolü
+    if (head.x < 0 || head.x >= GRID_WIDTH || head.y < 0 || head.y >= GRID_HEIGHT) {
+      return true;
+    }
+
+    // Kendi gövdesine çarpma kontrolü (baş hariç)
+    for (let i = 1; i < body.length; i++) {
+      if (head.x === body[i].x && head.y === body[i].y) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  // ============= YANMA EFEKTİ PARÇACIK OLUŞTURMA =============
+  const createFireParticles = (snakeBody: Point[]): Particle[] => {
+    const particles: Particle[] = [];
+
+    // Her yılan segmenti için parçacıklar oluştur
+    snakeBody.forEach((segment) => {
+      const particleCount = 8; // Her segment için 8 parçacık
+      for (let i = 0; i < particleCount; i++) {
+        const angle = (Math.PI * 2 * i) / particleCount + Math.random() * 0.5;
+        const speed = 2 + Math.random() * 3;
+        particles.push({
+          x: segment.x * CELL_SIZE + CELL_SIZE / 2,
+          y: segment.y * CELL_SIZE + CELL_SIZE / 2,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed - 2, // Yukarı doğru
+          life: 1.0,
+          color: COLORS.fire[Math.floor(Math.random() * COLORS.fire.length)],
+          size: 4 + Math.random() * 6,
+        });
+      }
+    });
+
+    return particles;
+  };
+
+  // ============= RASTGELE YEM KONUMU =============
   const generateFood = (snake: Point[]): Point => {
     let newFood: Point;
     let attempts = 0;
@@ -96,42 +184,107 @@ function App() {
     return newFood;
   };
 
-  // Oyunu başlat
-  useEffect(() => {
-    const hamiltonianPath = createHamiltonianCycle();
-    const startPoint = hamiltonianPath[0];
+  // ============= OYUNU SIFIRLAMA =============
+  const resetGame = () => {
+    // Rastgele başlangıç pozisyonu
+    const startX = Math.floor(GRID_WIDTH / 4 + Math.random() * (GRID_WIDTH / 2));
+    const startY = Math.floor(GRID_HEIGHT / 4 + Math.random() * (GRID_HEIGHT / 2));
+    
+    const initialSnake = [{ x: startX, y: startY }];
     
     gameStateRef.current = {
-      snake: [startPoint],
-      previousSnake: [startPoint], // Başlangıçta önceki pozisyon da aynı
-      food: generateFood([startPoint]),
-      hamiltonianPath,
-      pathIndex: 0,
+      snake: initialSnake,
+      previousSnake: [...initialSnake],
+      food: generateFood(initialSnake),
+      direction: { x: 1, y: 0 },
       hasEaten: false,
       lastUpdateTime: performance.now(),
+      isGameOver: false,
+      deathTime: 0,
+      particles: [],
     };
+
+    setScore(0);
+    setGameCount(prev => prev + 1);
+  };
+
+  // FPS kontrol fonksiyonları
+  const decreaseFps = () => {
+    setFps(prev => Math.max(MIN_FPS, prev - FPS_STEP));
+  };
+
+  const increaseFps = () => {
+    setFps(prev => Math.min(MAX_FPS, prev + FPS_STEP));
+  };
+
+  // ============= OYUNU BAŞLAT =============
+  useEffect(() => {
+    resetGame();
   }, []);
 
-  // ========== OYUN MANTIĞI DÖNGÜSÜ (FPS bazlı) ==========
-  // Bu döngü sadece yılanın grid pozisyonunu günceller, çizim yapmaz
+  // ============= OYUN MANTIĞI DÖNGÜSÜ =============
   useEffect(() => {
     const gameLogicInterval = setInterval(() => {
       const state = gameStateRef.current;
-      
-      // Önceki pozisyonları kaydet (smooth geçiş için)
-      state.previousSnake = state.snake.map(segment => ({ ...segment }));
-      
-      // Son güncelleme zamanını kaydet
-      state.lastUpdateTime = performance.now();
-      
-      // Hamiltonian yolu takip et
-      state.pathIndex = (state.pathIndex + 1) % state.hamiltonianPath.length;
-      const nextPosition = state.hamiltonianPath[state.pathIndex];
 
-      // Yılanı hareket ettir (sadece grid pozisyonları)
+      // Oyun bittiyse mantık çalışmasın
+      if (state.isGameOver) {
+        // Ölüm animasyonu bittiyse otomatik reset
+        const timeSinceDeath = performance.now() - state.deathTime;
+        if (timeSinceDeath > RESET_DELAY) {
+          resetGame();
+        }
+        return;
+      }
+
+      // Önceki pozisyonları kaydet
+      state.previousSnake = state.snake.map(segment => ({ ...segment }));
+      state.lastUpdateTime = performance.now();
+
+      const head = state.snake[0];
+      const body = state.snake.slice(1); // Baş hariç gövde
+
+      // BFS ile yeme giden en kısa yolu bul
+      const path = findPathBFS(head, state.food, body);
+
+      let nextPosition: Point;
+
+      if (path.length > 1) {
+        // Yol bulunduysa, bir sonraki adımı al (path[0] = şimdiki pozisyon, path[1] = sonraki)
+        nextPosition = path[1];
+        
+        // Yönü güncelle
+        state.direction = {
+          x: nextPosition.x - head.x,
+          y: nextPosition.y - head.y,
+        };
+      } else {
+        // Yol bulunamadıysa, mevcut yönde devam et (fallback)
+        nextPosition = {
+          x: head.x + state.direction.x,
+          y: head.y + state.direction.y,
+        };
+      }
+
+      // Yeni yılan pozisyonu
       const newSnake = [nextPosition, ...state.snake];
-      
-      // Yem yendi mi kontrol et
+
+      // Çarpışma kontrolü
+      if (checkCollision(nextPosition, state.snake)) {
+        // GAME OVER!
+        state.isGameOver = true;
+        state.deathTime = performance.now();
+        state.particles = createFireParticles(state.snake);
+        
+        // High score güncelle
+        if (score > highScore) {
+          setHighScore(score);
+        }
+        
+        return;
+      }
+
+      // Yem yeme kontrolü
       if (nextPosition.x === state.food.x && nextPosition.y === state.food.y) {
         state.hasEaten = true;
         setScore(prev => prev + 1);
@@ -146,20 +299,16 @@ function App() {
       }
 
       state.snake = newSnake;
-      
-      // previousSnake uzunluğunu snake ile senkronize et
-      // Yem yeme durumunda previousSnake'e yeni segment ekle
+
+      // previousSnake senkronizasyonu
       if (state.hasEaten) {
         state.previousSnake = [...state.previousSnake, state.previousSnake[state.previousSnake.length - 1]];
         state.hasEaten = false;
       }
-      
-      // previousSnake çok uzunsa kırp
+
       while (state.previousSnake.length > state.snake.length) {
         state.previousSnake.pop();
       }
-      
-      // previousSnake çok kısaysa genişlet
       while (state.previousSnake.length < state.snake.length) {
         state.previousSnake.push({ ...state.snake[state.snake.length - 1] });
       }
@@ -167,10 +316,9 @@ function App() {
     }, 1000 / fps);
 
     return () => clearInterval(gameLogicInterval);
-  }, [fps]);
+  }, [fps, score, highScore]);
 
-  // ========== RENDER DÖNGÜSÜ (60 FPS requestAnimationFrame) ==========
-  // Bu döngü sadece ekrana çizer, oyun mantığına dokunmaz
+  // ============= RENDER DÖNGÜSÜ (60 FPS) =============
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -183,46 +331,54 @@ function App() {
     const renderLoop = () => {
       const state = gameStateRef.current;
       const now = performance.now();
-      
-      // Son mantık güncellemesinden bu yana geçen süre
+
+      // Parçacıkları güncelle (yanma efekti için)
+      if (state.isGameOver && state.particles.length > 0) {
+        state.particles = state.particles
+          .map(p => ({
+            ...p,
+            x: p.x + p.vx,
+            y: p.y + p.vy,
+            vy: p.vy + 0.2, // Yerçekimi
+            life: p.life - 0.02,
+            size: p.size * 0.97,
+          }))
+          .filter(p => p.life > 0);
+      }
+
+      // İnterpolasyon faktörü
       const timeSinceUpdate = now - state.lastUpdateTime;
-      
-      // Bir sonraki güncellemeye kadar geçmesi gereken süre
       const updateInterval = 1000 / fps;
-      
-      // İnterpolasyon faktörü: 0 (tam önceki pozisyon) ile 1 (tam şimdiki pozisyon) arası
       const interpolationFactor = Math.min(timeSinceUpdate / updateInterval, 1);
       
-      // Oyunu çiz (smooth interpolasyon ile)
-      drawGame(ctx, state, interpolationFactor);
+      // Çizim
+      drawGame(ctx, state, interpolationFactor, now);
       
-      // Bir sonraki frame'i planla
       animationFrameId = requestAnimationFrame(renderLoop);
     };
     
-    // Render loop'u başlat
     renderLoop();
     
-    // Cleanup: component unmount olduğunda animasyonu durdur
     return () => {
       cancelAnimationFrame(animationFrameId);
     };
-  }, [fps]); // fps değiştiğinde render loop yeniden başlar
+  }, [fps]);
 
-  // ========== ÇİZİM FONKSİYONU (Smooth Interpolation ile) ==========
+  // ============= ÇİZİM FONKSİYONU =============
   const drawGame = (
     ctx: CanvasRenderingContext2D, 
     state: typeof gameStateRef.current,
-    interpolationFactor: number // 0-1 arası, pozisyonlar arası geçiş yüzdesi
+    interpolationFactor: number,
+    currentTime: number
   ) => {
-    // Gradient arka plan
+    // Arka plan gradient
     const gradient = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
     gradient.addColorStop(0, COLORS.background);
     gradient.addColorStop(1, COLORS.backgroundGradient);
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Grid çizgileri (opsiyonel, hafif)
+    // Grid çizgileri
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
     ctx.lineWidth = 1;
     for (let x = 0; x <= CANVAS_WIDTH; x += CELL_SIZE) {
@@ -238,11 +394,10 @@ function App() {
       ctx.stroke();
     }
 
-    // Yem çiz (parlayan efekt) - yem hareket etmediği için interpolasyon yok
+    // Yem çiz
     const foodX = state.food.x * CELL_SIZE;
     const foodY = state.food.y * CELL_SIZE;
     
-    // Glow efekti
     ctx.shadowBlur = 20;
     ctx.shadowColor = COLORS.food;
     ctx.fillStyle = COLORS.food;
@@ -257,45 +412,108 @@ function App() {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // ========== YILAN ÇİZİMİ (SMOOTH INTERPOLATION) ==========
-    state.snake.forEach((segment, index) => {
-      // Önceki pozisyonu al (eğer varsa)
-      const prevSegment = state.previousSnake[index] || segment;
-      
-      // Linear interpolation (lerp) ile yumuşak geçiş
-      // gerçekPozisyon = önceki + (şimdiki - önceki) * faktör
-      const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
-      const lerpY = prevSegment.y + (segment.y - prevSegment.y) * interpolationFactor;
-      
-      // Piksel koordinatlarına çevir
-      const x = lerpX * CELL_SIZE;
-      const y = lerpY * CELL_SIZE;
+    // ========== YILAN ÇİZİMİ ==========
+    if (!state.isGameOver) {
+      // Normal çizim (smooth interpolation)
+      state.snake.forEach((segment, index) => {
+        const prevSegment = state.previousSnake[index] || segment;
+        
+        const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
+        const lerpY = prevSegment.y + (segment.y - prevSegment.y) * interpolationFactor;
+        
+        const x = lerpX * CELL_SIZE;
+        const y = lerpY * CELL_SIZE;
 
-      // Renk ve efekt ayarları
-      if (index === 0) {
-        // Baş - daha parlak
-        ctx.fillStyle = COLORS.snakeHead;
-        ctx.shadowBlur = 15;
-        ctx.shadowColor = COLORS.snake;
-      } else {
-        // Gövde - gradient efekt
-        const opacity = 1 - (index / state.snake.length) * 0.3;
-        ctx.fillStyle = COLORS.snake;
-        ctx.globalAlpha = opacity;
-        ctx.shadowBlur = 5;
-        ctx.shadowColor = COLORS.snake;
-      }
+        if (index === 0) {
+          ctx.fillStyle = COLORS.snakeHead;
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = COLORS.snake;
+        } else {
+          const opacity = 1 - (index / state.snake.length) * 0.3;
+          ctx.fillStyle = COLORS.snake;
+          ctx.globalAlpha = opacity;
+          ctx.shadowBlur = 5;
+          ctx.shadowColor = COLORS.snake;
+        }
 
-      // Yuvarlak köşeli dikdörtgen çiz
-      const radius = 4;
-      ctx.beginPath();
-      ctx.roundRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2, radius);
-      ctx.fill();
-      
-      // Opacity ve shadow'u sıfırla
-      ctx.globalAlpha = 1;
+        const radius = 4;
+        ctx.beginPath();
+        ctx.roundRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2, radius);
+        ctx.fill();
+        
+        ctx.globalAlpha = 1;
+        ctx.shadowBlur = 0;
+      });
+    } else {
+      // ========== YANMA EFEKTİ ÇİZİMİ ==========
+      const timeSinceDeath = currentTime - state.deathTime;
+      const deathProgress = Math.min(timeSinceDeath / DEATH_ANIMATION_DURATION, 1);
+
+      // Yılanı yanma renkleriyle çiz
+      state.snake.forEach((segment) => {
+        const x = segment.x * CELL_SIZE;
+        const y = segment.y * CELL_SIZE;
+
+        // Yanan renk (sarıdan kırmızıya gradient)
+        const fireColorIndex = Math.floor((1 - deathProgress) * (COLORS.fire.length - 1));
+        ctx.fillStyle = COLORS.fire[fireColorIndex];
+        
+        // Yanma glow efekti
+        ctx.shadowBlur = 30 * (1 - deathProgress);
+        ctx.shadowColor = '#ff4500';
+        
+        // Segment boyutu küçülsün (yanıyor)
+        const shrinkFactor = 1 - deathProgress * 0.5;
+        const offset = CELL_SIZE * (1 - shrinkFactor) / 2;
+
+        ctx.beginPath();
+        ctx.roundRect(
+          x + offset, 
+          y + offset, 
+          CELL_SIZE * shrinkFactor, 
+          CELL_SIZE * shrinkFactor, 
+          4
+        );
+        ctx.fill();
+      });
+
       ctx.shadowBlur = 0;
-    });
+
+      // Parçacıkları çiz
+      state.particles.forEach(particle => {
+        ctx.fillStyle = particle.color;
+        ctx.globalAlpha = particle.life;
+        ctx.beginPath();
+        ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+        ctx.fill();
+      });
+
+      ctx.globalAlpha = 1;
+
+      // ========== GAME OVER YAZISI ==========
+      if (timeSinceDeath < 1000) {
+        ctx.save();
+        
+        const scale = Math.min(timeSinceDeath / 200, 1);
+        const opacity = 1 - Math.max((timeSinceDeath - 800) / 200, 0);
+        
+        ctx.globalAlpha = opacity;
+        ctx.translate(CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
+        ctx.scale(scale, scale);
+        
+        // Glow efekti
+        ctx.shadowBlur = 40;
+        ctx.shadowColor = '#ff0000';
+        
+        ctx.fillStyle = '#ff0000';
+        ctx.font = 'bold 80px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('💥 ÇARPTI!', 0, 0);
+        
+        ctx.restore();
+      }
+    }
   };
 
   return (
@@ -305,36 +523,58 @@ function App() {
           🤖 AI Yılan Oyunu
         </h1>
         <p className="text-gray-300 text-sm">
-          Hamiltonian Cycle Algoritması ile Otomatik Oynuyor
+          BFS Pathfinding Algoritması ile Akıllı Yol Bulma
         </p>
       </div>
 
-      {/* Skor Göstergesi */}
-      <div 
-        className={`mb-4 transition-all duration-300 ${
-          levelUp ? 'scale-125' : 'scale-100'
-        }`}
-      >
-        <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-yellow-600 text-gray-900 px-8 py-4 rounded-lg shadow-2xl">
+      {/* Skor Göstergeleri */}
+      <div className="flex gap-4 mb-4">
+        {/* Mevcut Skor */}
+        <div 
+          className={`transition-all duration-300 ${
+            levelUp ? 'scale-125' : 'scale-100'
+          }`}
+        >
+          <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-yellow-600 text-gray-900 px-8 py-4 rounded-lg shadow-2xl">
+            <div className="text-center">
+              <div className="text-sm font-semibold uppercase tracking-wider">Skor</div>
+              <div className={`text-6xl font-bold ${levelUp ? 'animate-pulse' : ''}`}>
+                {score}
+              </div>
+            </div>
+          </div>
+          {levelUp && (
+            <div className="text-center mt-2 text-yellow-400 font-bold text-xl animate-bounce">
+              🎉 +1
+            </div>
+          )}
+        </div>
+
+        {/* En Yüksek Skor */}
+        <div className="bg-gradient-to-r from-purple-400 via-purple-500 to-purple-600 text-white px-8 py-4 rounded-lg shadow-2xl">
           <div className="text-center">
-            <div className="text-sm font-semibold uppercase tracking-wider">Skor</div>
-            <div className={`text-6xl font-bold ${levelUp ? 'animate-pulse' : ''}`}>
-              {score}
+            <div className="text-sm font-semibold uppercase tracking-wider">En Yüksek</div>
+            <div className="text-6xl font-bold">
+              {highScore}
             </div>
           </div>
         </div>
-        {levelUp && (
-          <div className="text-center mt-2 text-yellow-400 font-bold text-xl animate-bounce">
-            🎉 +1
+
+        {/* Oyun Sayısı */}
+        <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600 text-white px-8 py-4 rounded-lg shadow-2xl">
+          <div className="text-center">
+            <div className="text-sm font-semibold uppercase tracking-wider">Deneme</div>
+            <div className="text-6xl font-bold">
+              #{gameCount}
+            </div>
           </div>
-        )}
+        </div>
       </div>
 
       {/* HIZ KONTROL PANELİ */}
       <div className="mb-4 bg-gradient-to-r from-purple-600 via-purple-500 to-pink-500 p-1 rounded-xl shadow-2xl">
         <div className="bg-gray-900 bg-opacity-90 backdrop-blur-sm px-8 py-4 rounded-lg">
           <div className="flex items-center gap-6">
-            {/* Yavaşlat Butonu */}
             <button
               onClick={decreaseFps}
               disabled={fps <= MIN_FPS}
@@ -350,7 +590,6 @@ function App() {
               ⏪ Yavaşlat
             </button>
 
-            {/* FPS Göstergesi */}
             <div className="flex flex-col items-center min-w-[140px]">
               <div className="text-gray-400 text-xs uppercase tracking-wider mb-1">
                 Oyun Hızı
@@ -365,7 +604,6 @@ function App() {
               </div>
             </div>
 
-            {/* Hızlandır Butonu */}
             <button
               onClick={increaseFps}
               disabled={fps >= MAX_FPS}
@@ -382,7 +620,6 @@ function App() {
             </button>
           </div>
 
-          {/* FPS Aralığı Göstergesi */}
           <div className="mt-3 flex justify-center">
             <div className="bg-gray-800 px-4 py-1 rounded-full text-xs text-gray-400">
               Min: {MIN_FPS} • Max: {MAX_FPS} • Adım: ±{FPS_STEP}
@@ -409,7 +646,7 @@ function App() {
             <span className="ml-2 font-bold">{score + 1}</span>
           </div>
           <div>
-            <span className="text-gray-400">Maksimum:</span>
+            <span className="text-gray-400">Maksimum Alan:</span>
             <span className="ml-2 font-bold">{GRID_WIDTH * GRID_HEIGHT}</span>
           </div>
           <div>
@@ -417,23 +654,24 @@ function App() {
             <span className="ml-2 font-bold text-yellow-400">{fps}</span>
           </div>
           <div>
-            <span className="text-gray-400">İlerleme:</span>
-            <span className="ml-2 font-bold">
-              {((score / (GRID_WIDTH * GRID_HEIGHT - 1)) * 100).toFixed(1)}%
-            </span>
+            <span className="text-gray-400">Algoritma:</span>
+            <span className="ml-2 font-bold text-green-400">BFS</span>
           </div>
         </div>
         <div className="mt-4 text-center text-gray-400 text-xs">
-          💡 Hamiltonian Cycle algoritması sayesinde yılan hiç ölmeden tüm ekranı doldurur
+          🧠 BFS (Breadth-First Search) algoritması ile yılan yeme giden en kısa yolu bulur
         </div>
         <div className="mt-2 text-center text-green-400 text-xs font-semibold">
           ✨ Smooth animasyon: Oyun mantığı {fps} FPS, çizim 60 FPS
+        </div>
+        <div className="mt-2 text-center text-orange-400 text-xs">
+          💥 Duvara veya kendi gövdesine çarparsa otomatik yeniden başlar
         </div>
       </div>
 
       {/* Kontroller */}
       <div className="mt-4 text-gray-400 text-xs text-center max-w-md">
-        <p>🎮 Oyun tamamen otomatik - hiçbir tuşa basmanıza gerek yok!</p>
+        <p>🎮 Oyun tamamen otomatik - AI kendi yolunu bulur!</p>
         <p className="mt-1">⚡ Yukarıdaki butonlarla oyun hızını canlı olarak değiştirin</p>
       </div>
     </div>
