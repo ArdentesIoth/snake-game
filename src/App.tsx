@@ -6,7 +6,11 @@ const CANVAS_HEIGHT = 600;
 const CELL_SIZE = 20; // 20x20 piksel hücreler
 const GRID_WIDTH = CANVAS_WIDTH / CELL_SIZE; // 40
 const GRID_HEIGHT = CANVAS_HEIGHT / CELL_SIZE; // 30
-const FPS = 10; // Oyun hızı (artırarak hızlandırabilirsiniz)
+
+// FPS limitleri
+const MIN_FPS = 1;
+const MAX_FPS = 60;
+const FPS_STEP = 5; // Her buton tıklamasında ne kadar değişecek
 
 // Renkler
 const COLORS = {
@@ -28,6 +32,8 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [score, setScore] = useState(0);
   const [levelUp, setLevelUp] = useState(false);
+  const [fps, setFps] = useState(15); // Dinamik FPS state
+  
   const gameStateRef = useRef({
     snake: [{ x: 0, y: 0 }],
     food: { x: 10, y: 10 },
@@ -35,6 +41,15 @@ function App() {
     pathIndex: 0,
     hasEaten: false,
   });
+
+  // FPS kontrol fonksiyonları
+  const decreaseFps = () => {
+    setFps(prev => Math.max(MIN_FPS, prev - FPS_STEP));
+  };
+
+  const increaseFps = () => {
+    setFps(prev => Math.min(MAX_FPS, prev + FPS_STEP));
+  };
 
   // Hamiltonian Cycle oluştur - Zigzag pattern
   const createHamiltonianCycle = (): Point[] => {
@@ -92,7 +107,7 @@ function App() {
     };
   }, []);
 
-  // Oyun döngüsü
+  // Oyun döngüsü - fps değiştiğinde otomatik güncellenir
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -128,10 +143,10 @@ function App() {
 
       // Çizim
       drawGame(ctx, state);
-    }, 1000 / FPS);
+    }, 1000 / fps); // fps state'ini kullanıyor
 
     return () => clearInterval(gameLoop);
-  }, []);
+  }, [fps]); // fps değiştiğinde useEffect yeniden çalışır
 
   // Oyunu çiz
   const drawGame = (ctx: CanvasRenderingContext2D, state: typeof gameStateRef.current) => {
@@ -208,7 +223,7 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900">
+    <div className="min-h-screen flex flex-col items-center justify-center bg-gradient-to-br from-gray-900 via-purple-900 to-gray-900 py-8">
       <div className="mb-6 text-center">
         <h1 className="text-4xl font-bold text-white mb-2">
           🤖 AI Yılan Oyunu
@@ -239,6 +254,67 @@ function App() {
         )}
       </div>
 
+      {/* HIZ KONTROL PANELİ */}
+      <div className="mb-4 bg-gradient-to-r from-purple-600 via-purple-500 to-pink-500 p-1 rounded-xl shadow-2xl">
+        <div className="bg-gray-900 bg-opacity-90 backdrop-blur-sm px-8 py-4 rounded-lg">
+          <div className="flex items-center gap-6">
+            {/* Yavaşlat Butonu */}
+            <button
+              onClick={decreaseFps}
+              disabled={fps <= MIN_FPS}
+              className={`
+                px-6 py-3 rounded-lg font-bold text-lg
+                transition-all duration-200 transform
+                ${fps <= MIN_FPS 
+                  ? 'bg-gray-700 text-gray-500 cursor-not-allowed' 
+                  : 'bg-gradient-to-r from-blue-500 to-blue-600 text-white hover:from-blue-600 hover:to-blue-700 hover:scale-105 hover:shadow-lg hover:shadow-blue-500/50 active:scale-95'
+                }
+              `}
+            >
+              ⏪ Yavaşlat
+            </button>
+
+            {/* FPS Göstergesi */}
+            <div className="flex flex-col items-center min-w-[140px]">
+              <div className="text-gray-400 text-xs uppercase tracking-wider mb-1">
+                Oyun Hızı
+              </div>
+              <div className="bg-gradient-to-r from-yellow-400 to-orange-500 text-transparent bg-clip-text">
+                <div className="text-5xl font-black tracking-tight">
+                  {fps}
+                </div>
+              </div>
+              <div className="text-gray-400 text-xs uppercase tracking-wider mt-1">
+                FPS
+              </div>
+            </div>
+
+            {/* Hızlandır Butonu */}
+            <button
+              onClick={increaseFps}
+              disabled={fps >= MAX_FPS}
+              className={`
+                px-6 py-3 rounded-lg font-bold text-lg
+                transition-all duration-200 transform
+                ${fps >= MAX_FPS 
+                  ? 'bg-gray-700 text-gray-500 cursor-not-allowed' 
+                  : 'bg-gradient-to-r from-green-500 to-green-600 text-white hover:from-green-600 hover:to-green-700 hover:scale-105 hover:shadow-lg hover:shadow-green-500/50 active:scale-95'
+                }
+              `}
+            >
+              Hızlandır ⏩
+            </button>
+          </div>
+
+          {/* FPS Aralığı Göstergesi */}
+          <div className="mt-3 flex justify-center">
+            <div className="bg-gray-800 px-4 py-1 rounded-full text-xs text-gray-400">
+              Min: {MIN_FPS} • Max: {MAX_FPS} • Adım: ±{FPS_STEP}
+            </div>
+          </div>
+        </div>
+      </div>
+
       {/* Oyun Canvas */}
       <div className="relative shadow-2xl rounded-lg overflow-hidden border-4 border-purple-500">
         <canvas
@@ -262,7 +338,7 @@ function App() {
           </div>
           <div>
             <span className="text-gray-400">Hız (FPS):</span>
-            <span className="ml-2 font-bold">{FPS}</span>
+            <span className="ml-2 font-bold text-yellow-400">{fps}</span>
           </div>
           <div>
             <span className="text-gray-400">İlerleme:</span>
@@ -277,9 +353,9 @@ function App() {
       </div>
 
       {/* Kontroller */}
-      <div className="mt-4 text-gray-400 text-xs">
+      <div className="mt-4 text-gray-400 text-xs text-center max-w-md">
         <p>🎮 Oyun tamamen otomatik - hiçbir tuşa basmanıza gerek yok!</p>
-        <p className="mt-1">⚙️ Hızı ayarlamak için App.tsx dosyasındaki FPS değişkenini değiştirin</p>
+        <p className="mt-1">⚡ Yukarıdaki butonlarla oyun hızını canlı olarak değiştirin</p>
       </div>
     </div>
   );
