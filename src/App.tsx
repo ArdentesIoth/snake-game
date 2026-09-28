@@ -22,6 +22,7 @@ const COLORS = {
   backgroundGradient: '#16213e',
   snake: '#00ff88',
   snakeHead: '#00cc6a',
+  snakeTail: '#006644', // Kuyruk için daha koyu ton
   food: '#ff0066',
   text: '#ffffff',
   scoreGlow: '#ffd700',
@@ -55,10 +56,11 @@ const DIRECTIONS = [
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  // State'ler korunuyor ama UI'da gösterilmeyecek
   const [score, setScore] = useState(0);
   const [highScore, setHighScore] = useState(0);
-  const [gameCount, setGameCount] = useState(1);
-  const [levelUp, setLevelUp] = useState(false);
+  const [, setGameCount] = useState(1);
   const [fps, setFps] = useState(15);
   
   // Oyun state'i
@@ -71,36 +73,28 @@ function App() {
     lastUpdateTime: 0,
     isGameOver: false,
     deathTime: 0,
-    particles: [] as Particle[], // Yanma efekti parçacıkları
+    particles: [] as Particle[],
   });
 
   // ============= BFS PATHFINDING ALGORİTMASI =============
-  // Yılan başından yeme giden en kısa yolu bulur
   const findPathBFS = (start: Point, target: Point, obstacles: Point[]): Point[] => {
-    // Noktayı string'e çevir (hashmap için)
     const pointToKey = (p: Point) => `${p.x},${p.y}`;
 
-    // Engelleri bir Set'e çevir (hızlı arama için)
     const obstacleSet = new Set(obstacles.map(pointToKey));
-
-    // BFS için kuyruk ve ziyaret edilenler
     const queue: { point: Point; path: Point[] }[] = [{ point: start, path: [start] }];
     const visited = new Set<string>([pointToKey(start)]);
 
     while (queue.length > 0) {
       const { point, path } = queue.shift()!;
 
-      // Hedefe ulaştık mı?
       if (point.x === target.x && point.y === target.y) {
         return path;
       }
 
-      // 4 yönü dene
       for (const dir of DIRECTIONS) {
         const nextPoint = { x: point.x + dir.x, y: point.y + dir.y };
         const nextKey = pointToKey(nextPoint);
 
-        // Geçerli pozisyon mu kontrol et
         if (
           nextPoint.x >= 0 &&
           nextPoint.x < GRID_WIDTH &&
@@ -118,18 +112,15 @@ function App() {
       }
     }
 
-    // Yol bulunamadı
     return [];
   };
 
   // ============= ÇARPIŞMA KONTROLÜ =============
   const checkCollision = (head: Point, body: Point[]): boolean => {
-    // Duvara çarpma kontrolü
     if (head.x < 0 || head.x >= GRID_WIDTH || head.y < 0 || head.y >= GRID_HEIGHT) {
       return true;
     }
 
-    // Kendi gövdesine çarpma kontrolü (baş hariç)
     for (let i = 1; i < body.length; i++) {
       if (head.x === body[i].x && head.y === body[i].y) {
         return true;
@@ -143,9 +134,8 @@ function App() {
   const createFireParticles = (snakeBody: Point[]): Particle[] => {
     const particles: Particle[] = [];
 
-    // Her yılan segmenti için parçacıklar oluştur
     snakeBody.forEach((segment) => {
-      const particleCount = 8; // Her segment için 8 parçacık
+      const particleCount = 8;
       for (let i = 0; i < particleCount; i++) {
         const angle = (Math.PI * 2 * i) / particleCount + Math.random() * 0.5;
         const speed = 2 + Math.random() * 3;
@@ -153,7 +143,7 @@ function App() {
           x: segment.x * CELL_SIZE + CELL_SIZE / 2,
           y: segment.y * CELL_SIZE + CELL_SIZE / 2,
           vx: Math.cos(angle) * speed,
-          vy: Math.sin(angle) * speed - 2, // Yukarı doğru
+          vy: Math.sin(angle) * speed - 2,
           life: 1.0,
           color: COLORS.fire[Math.floor(Math.random() * COLORS.fire.length)],
           size: 4 + Math.random() * 6,
@@ -186,7 +176,6 @@ function App() {
 
   // ============= OYUNU SIFIRLAMA =============
   const resetGame = () => {
-    // Rastgele başlangıç pozisyonu
     const startX = Math.floor(GRID_WIDTH / 4 + Math.random() * (GRID_WIDTH / 2));
     const startY = Math.floor(GRID_HEIGHT / 4 + Math.random() * (GRID_HEIGHT / 2));
     
@@ -227,9 +216,7 @@ function App() {
     const gameLogicInterval = setInterval(() => {
       const state = gameStateRef.current;
 
-      // Oyun bittiyse mantık çalışmasın
       if (state.isGameOver) {
-        // Ölüm animasyonu bittiyse otomatik reset
         const timeSinceDeath = performance.now() - state.deathTime;
         if (timeSinceDeath > RESET_DELAY) {
           resetGame();
@@ -237,46 +224,36 @@ function App() {
         return;
       }
 
-      // Önceki pozisyonları kaydet
       state.previousSnake = state.snake.map(segment => ({ ...segment }));
       state.lastUpdateTime = performance.now();
 
       const head = state.snake[0];
-      const body = state.snake.slice(1); // Baş hariç gövde
+      const body = state.snake.slice(1);
 
-      // BFS ile yeme giden en kısa yolu bul
       const path = findPathBFS(head, state.food, body);
 
       let nextPosition: Point;
 
       if (path.length > 1) {
-        // Yol bulunduysa, bir sonraki adımı al (path[0] = şimdiki pozisyon, path[1] = sonraki)
         nextPosition = path[1];
-        
-        // Yönü güncelle
         state.direction = {
           x: nextPosition.x - head.x,
           y: nextPosition.y - head.y,
         };
       } else {
-        // Yol bulunamadıysa, mevcut yönde devam et (fallback)
         nextPosition = {
           x: head.x + state.direction.x,
           y: head.y + state.direction.y,
         };
       }
 
-      // Yeni yılan pozisyonu
       const newSnake = [nextPosition, ...state.snake];
 
-      // Çarpışma kontrolü
       if (checkCollision(nextPosition, state.snake)) {
-        // GAME OVER!
         state.isGameOver = true;
         state.deathTime = performance.now();
         state.particles = createFireParticles(state.snake);
         
-        // High score güncelle
         if (score > highScore) {
           setHighScore(score);
         }
@@ -284,23 +261,16 @@ function App() {
         return;
       }
 
-      // Yem yeme kontrolü
       if (nextPosition.x === state.food.x && nextPosition.y === state.food.y) {
         state.hasEaten = true;
         setScore(prev => prev + 1);
         state.food = generateFood(newSnake);
-        
-        // Level up efekti
-        setLevelUp(true);
-        setTimeout(() => setLevelUp(false), 300);
       } else {
-        // Yem yenmediyse kuyruk kısalır
         newSnake.pop();
       }
 
       state.snake = newSnake;
 
-      // previousSnake senkronizasyonu
       if (state.hasEaten) {
         state.previousSnake = [...state.previousSnake, state.previousSnake[state.previousSnake.length - 1]];
         state.hasEaten = false;
@@ -332,26 +302,23 @@ function App() {
       const state = gameStateRef.current;
       const now = performance.now();
 
-      // Parçacıkları güncelle (yanma efekti için)
       if (state.isGameOver && state.particles.length > 0) {
         state.particles = state.particles
           .map(p => ({
             ...p,
             x: p.x + p.vx,
             y: p.y + p.vy,
-            vy: p.vy + 0.2, // Yerçekimi
+            vy: p.vy + 0.2,
             life: p.life - 0.02,
             size: p.size * 0.97,
           }))
           .filter(p => p.life > 0);
       }
 
-      // İnterpolasyon faktörü
       const timeSinceUpdate = now - state.lastUpdateTime;
       const updateInterval = 1000 / fps;
       const interpolationFactor = Math.min(timeSinceUpdate / updateInterval, 1);
       
-      // Çizim
       drawGame(ctx, state, interpolationFactor, now);
       
       animationFrameId = requestAnimationFrame(renderLoop);
@@ -412,57 +379,172 @@ function App() {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // ========== YILAN ÇİZİMİ ==========
-    if (!state.isGameOver) {
-      // Normal çizim (smooth interpolation)
-      state.snake.forEach((segment, index) => {
+    // ========== YENİ YILAN ÇİZİMİ - TEK PARÇA AKICI GÖVDE ==========
+    if (!state.isGameOver && state.snake.length > 0) {
+      
+      // Interpolated pozisyonları hesapla
+      const interpolatedPositions = state.snake.map((segment, index) => {
         const prevSegment = state.previousSnake[index] || segment;
-        
         const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
         const lerpY = prevSegment.y + (segment.y - prevSegment.y) * interpolationFactor;
+        return {
+          x: lerpX * CELL_SIZE + CELL_SIZE / 2, // Merkez nokta
+          y: lerpY * CELL_SIZE + CELL_SIZE / 2,
+        };
+      });
+
+      // ===== YILAN GÖVDESİNİ ÇİZ (Smooth Path ile) =====
+      const bodyWidth = CELL_SIZE * 0.9; // Gövde kalınlığı
+      
+      // Her segment için daire çiz (örtüşmeli)
+      for (let i = state.snake.length - 1; i >= 0; i--) {
+        const pos = interpolatedPositions[i];
         
-        const x = lerpX * CELL_SIZE;
-        const y = lerpY * CELL_SIZE;
-
-        if (index === 0) {
-          ctx.fillStyle = COLORS.snakeHead;
-          ctx.shadowBlur = 15;
-          ctx.shadowColor = COLORS.snake;
-        } else {
-          const opacity = 1 - (index / state.snake.length) * 0.3;
-          ctx.fillStyle = COLORS.snake;
-          ctx.globalAlpha = opacity;
-          ctx.shadowBlur = 5;
-          ctx.shadowColor = COLORS.snake;
-        }
-
-        const radius = 4;
+        // Baştan kuyruğa renk gradient'i
+        const colorProgress = i / Math.max(state.snake.length - 1, 1);
+        const r1 = parseInt(COLORS.snakeHead.slice(1, 3), 16);
+        const g1 = parseInt(COLORS.snakeHead.slice(3, 5), 16);
+        const b1 = parseInt(COLORS.snakeHead.slice(5, 7), 16);
+        
+        const r2 = parseInt(COLORS.snakeTail.slice(1, 3), 16);
+        const g2 = parseInt(COLORS.snakeTail.slice(3, 5), 16);
+        const b2 = parseInt(COLORS.snakeTail.slice(5, 7), 16);
+        
+        const r = Math.round(r1 + (r2 - r1) * colorProgress);
+        const g = Math.round(g1 + (g2 - g1) * colorProgress);
+        const b = Math.round(b1 + (b2 - b1) * colorProgress);
+        
+        const segmentColor = `rgb(${r}, ${g}, ${b})`;
+        
+        // Glow efekti
+        ctx.shadowBlur = i === 0 ? 15 : 8;
+        ctx.shadowColor = i === 0 ? COLORS.snakeHead : COLORS.snake;
+        
+        // Segment dairesi
+        ctx.fillStyle = segmentColor;
         ctx.beginPath();
-        ctx.roundRect(x + 1, y + 1, CELL_SIZE - 2, CELL_SIZE - 2, radius);
+        ctx.arc(pos.x, pos.y, bodyWidth / 2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+      ctx.shadowBlur = 0;
+      
+      // ===== SEGMENTLER ARASI BAĞLANTI ÇİZGİLERİ =====
+      // Segmentler arası boşlukları doldur
+      for (let i = 0; i < interpolatedPositions.length - 1; i++) {
+        const pos1 = interpolatedPositions[i];
+        const pos2 = interpolatedPositions[i + 1];
+        
+        // Renk gradient'i
+        const colorProgress = i / Math.max(state.snake.length - 1, 1);
+        const r1 = parseInt(COLORS.snakeHead.slice(1, 3), 16);
+        const g1 = parseInt(COLORS.snakeHead.slice(3, 5), 16);
+        const b1 = parseInt(COLORS.snakeHead.slice(5, 7), 16);
+        
+        const r2 = parseInt(COLORS.snakeTail.slice(1, 3), 16);
+        const g2 = parseInt(COLORS.snakeTail.slice(3, 5), 16);
+        const b2 = parseInt(COLORS.snakeTail.slice(5, 7), 16);
+        
+        const r = Math.round(r1 + (r2 - r1) * colorProgress);
+        const g = Math.round(g1 + (g2 - g1) * colorProgress);
+        const b = Math.round(b1 + (b2 - b1) * colorProgress);
+        
+        ctx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
+        ctx.lineWidth = bodyWidth;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        
+        ctx.beginPath();
+        ctx.moveTo(pos1.x, pos1.y);
+        ctx.lineTo(pos2.x, pos2.y);
+        ctx.stroke();
+      }
+      
+      // ===== PUL DESENİ (Scale Pattern) =====
+      // Hafif çizgiler ile pul efekti
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
+      ctx.lineWidth = 1.5;
+      for (let i = 0; i < interpolatedPositions.length; i++) {
+        const pos = interpolatedPositions[i];
+        
+        // Her segment için 2-3 küçük çizgi (pul görünümü)
+        const scaleSize = bodyWidth * 0.3;
+        for (let j = 0; j < 3; j++) {
+          const angle = (Math.PI * 2 / 3) * j + i * 0.5;
+          const x1 = pos.x + Math.cos(angle) * scaleSize * 0.5;
+          const y1 = pos.y + Math.sin(angle) * scaleSize * 0.5;
+          const x2 = pos.x + Math.cos(angle) * scaleSize;
+          const y2 = pos.y + Math.sin(angle) * scaleSize;
+          
+          ctx.beginPath();
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+          ctx.stroke();
+        }
+      }
+      
+      // ===== YILAN BAŞINA GÖZLER EKLE =====
+      if (interpolatedPositions.length > 0) {
+        const headPos = interpolatedPositions[0];
+        const direction = state.direction;
+        
+        // Gözlerin pozisyonunu hareket yönüne göre ayarla
+        const eyeDistance = bodyWidth * 0.35;
+        
+        // Yön vektörüne dik vektör (gözler yan yana olsun)
+        const perpX = -direction.y;
+        const perpY = direction.x;
+        
+        // İlerleme yönünde gözleri biraz öne al
+        const forwardOffset = bodyWidth * 0.15;
+        
+        // İki göz pozisyonu
+        const eye1X = headPos.x + direction.x * forwardOffset + perpX * eyeDistance;
+        const eye1Y = headPos.y + direction.y * forwardOffset + perpY * eyeDistance;
+        const eye2X = headPos.x + direction.x * forwardOffset - perpX * eyeDistance;
+        const eye2Y = headPos.y + direction.y * forwardOffset - perpY * eyeDistance;
+        
+        // Göz çiz (beyaz dış, siyah iç)
+        const eyeSize = bodyWidth * 0.15;
+        
+        // Sol göz
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+        ctx.beginPath();
+        ctx.arc(eye1X, eye1Y, eyeSize, 0, Math.PI * 2);
         ctx.fill();
         
-        ctx.globalAlpha = 1;
-        ctx.shadowBlur = 0;
-      });
-    } else {
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+        ctx.beginPath();
+        ctx.arc(eye1X, eye1Y, eyeSize * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        
+        // Sağ göz
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+        ctx.beginPath();
+        ctx.arc(eye2X, eye2Y, eyeSize, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
+        ctx.beginPath();
+        ctx.arc(eye2X, eye2Y, eyeSize * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      
+    } else if (state.isGameOver) {
       // ========== YANMA EFEKTİ ÇİZİMİ ==========
       const timeSinceDeath = currentTime - state.deathTime;
       const deathProgress = Math.min(timeSinceDeath / DEATH_ANIMATION_DURATION, 1);
 
-      // Yılanı yanma renkleriyle çiz
       state.snake.forEach((segment) => {
         const x = segment.x * CELL_SIZE;
         const y = segment.y * CELL_SIZE;
 
-        // Yanan renk (sarıdan kırmızıya gradient)
         const fireColorIndex = Math.floor((1 - deathProgress) * (COLORS.fire.length - 1));
         ctx.fillStyle = COLORS.fire[fireColorIndex];
         
-        // Yanma glow efekti
         ctx.shadowBlur = 30 * (1 - deathProgress);
         ctx.shadowColor = '#ff4500';
         
-        // Segment boyutu küçülsün (yanıyor)
         const shrinkFactor = 1 - deathProgress * 0.5;
         const offset = CELL_SIZE * (1 - shrinkFactor) / 2;
 
@@ -479,7 +561,6 @@ function App() {
 
       ctx.shadowBlur = 0;
 
-      // Parçacıkları çiz
       state.particles.forEach(particle => {
         ctx.fillStyle = particle.color;
         ctx.globalAlpha = particle.life;
@@ -490,7 +571,7 @@ function App() {
 
       ctx.globalAlpha = 1;
 
-      // ========== GAME OVER YAZISI ==========
+      // GAME OVER YAZISI
       if (timeSinceDeath < 1000) {
         ctx.save();
         
@@ -501,7 +582,6 @@ function App() {
         ctx.translate(CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
         ctx.scale(scale, scale);
         
-        // Glow efekti
         ctx.shadowBlur = 40;
         ctx.shadowColor = '#ff0000';
         
@@ -527,49 +607,7 @@ function App() {
         </p>
       </div>
 
-      {/* Skor Göstergeleri */}
-      <div className="flex gap-4 mb-4">
-        {/* Mevcut Skor */}
-        <div 
-          className={`transition-all duration-300 ${
-            levelUp ? 'scale-125' : 'scale-100'
-          }`}
-        >
-          <div className="bg-gradient-to-r from-yellow-400 via-yellow-500 to-yellow-600 text-gray-900 px-8 py-4 rounded-lg shadow-2xl">
-            <div className="text-center">
-              <div className="text-sm font-semibold uppercase tracking-wider">Skor</div>
-              <div className={`text-6xl font-bold ${levelUp ? 'animate-pulse' : ''}`}>
-                {score}
-              </div>
-            </div>
-          </div>
-          {levelUp && (
-            <div className="text-center mt-2 text-yellow-400 font-bold text-xl animate-bounce">
-              🎉 +1
-            </div>
-          )}
-        </div>
-
-        {/* En Yüksek Skor */}
-        <div className="bg-gradient-to-r from-purple-400 via-purple-500 to-purple-600 text-white px-8 py-4 rounded-lg shadow-2xl">
-          <div className="text-center">
-            <div className="text-sm font-semibold uppercase tracking-wider">En Yüksek</div>
-            <div className="text-6xl font-bold">
-              {highScore}
-            </div>
-          </div>
-        </div>
-
-        {/* Oyun Sayısı */}
-        <div className="bg-gradient-to-r from-blue-400 via-blue-500 to-blue-600 text-white px-8 py-4 rounded-lg shadow-2xl">
-          <div className="text-center">
-            <div className="text-sm font-semibold uppercase tracking-wider">Deneme</div>
-            <div className="text-6xl font-bold">
-              #{gameCount}
-            </div>
-          </div>
-        </div>
-      </div>
+      {/* ÜST BİLGİ KUTULARI KALDIRILDI - State'ler arka planda çalışmaya devam ediyor */}
 
       {/* HIZ KONTROL PANELİ */}
       <div className="mb-4 bg-gradient-to-r from-purple-600 via-purple-500 to-pink-500 p-1 rounded-xl shadow-2xl">
