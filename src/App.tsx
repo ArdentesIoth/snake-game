@@ -3,24 +3,25 @@ import { useEffect, useRef, useState } from 'react';
 // ============= AYARLAR =============
 const CANVAS_WIDTH = 800;
 const CANVAS_HEIGHT = 600;
-const CELL_SIZE = 20; // 20x20 piksel hücreler
+const CELL_SIZE = 20;
 const GRID_WIDTH = CANVAS_WIDTH / CELL_SIZE; // 40
 const GRID_HEIGHT = CANVAS_HEIGHT / CELL_SIZE; // 30
 
-// FPS limitleri
 const MIN_FPS = 1;
 const MAX_FPS = 60;
 const FPS_STEP = 5;
 
-// Oyun ayarları
 const DEATH_ANIMATION_DURATION = 1500;
 const RESET_DELAY = 2000;
 
-// Yılan görsel ayarları
-const SNAKE_BASE_WIDTH = CELL_SIZE * 0.9; // Baş için maksimum genişlik
-const CURVE_RESOLUTION = 6; // Her segment arası kaç ara nokta (performance için ayarlanabilir)
+const SNAKE_BASE_WIDTH = CELL_SIZE * 0.9;
+const CURVE_RESOLUTION = 6;
 
-// Renkler
+// ============= GÜVENLİK SİSTEMİ AYARLARI =============
+const TAIL_SAFE_DISTANCE = 5; // Kuyruğun son kaç segmentine ulaşabilse yeterli
+const MIN_SAFE_SPACE_RATIO = 0.25; // En az grid alanının %25'ine erişebilmeli (biraz gevşetildi)
+const MAX_TAIL_CHASE_TICKS = 45; // Maksimum kaç tick kesintisiz kuyruk takibi yapılabilir (SONSUZ DÖNGÜ ÖNLEYİCİ)
+
 const COLORS = {
   background: '#1a1a2e',
   backgroundGradient: '#16213e',
@@ -73,27 +74,24 @@ function App() {
     isGameOver: false,
     deathTime: 0,
     particles: [] as Particle[],
+    consecutiveTailChaseCount: 0, // YENİ: Kaç tick'tir kuyruk takibi yapılıyor
   });
 
-  // ============= CATMULL-ROM SPLINE HESAPLAMA =============
-  // Verilen kontrol noktaları arasından geçen yumuşak bir eğri oluşturur
+  // ============= CATMULL-ROM SPLINE =============
   const catmullRomSpline = (
-    p0: Point,  // Önceki nokta
-    p1: Point,  // Başlangıç noktası
-    p2: Point,  // Bitiş noktası
-    p3: Point,  // Sonraki nokta
-    segments: number = CURVE_RESOLUTION // Kaç ara nokta oluşturulacak
+    p0: Point,
+    p1: Point,
+    p2: Point,
+    p3: Point,
+    segments: number = CURVE_RESOLUTION
   ): Point[] => {
     const points: Point[] = [];
     
-    // 0'dan 1'e kadar küçük adımlarla ilerle
     for (let i = 0; i <= segments; i++) {
-      const t = i / segments; // 0-1 arası interpolasyon faktörü
+      const t = i / segments;
       const t2 = t * t;
       const t3 = t2 * t;
       
-      // Catmull-Rom formülü (tension = 0.5 için)
-      // Her eksen için ayrı hesaplama
       const x = 0.5 * (
         2 * p1.x +
         (-p0.x + p2.x) * t +
@@ -114,23 +112,19 @@ function App() {
     return points;
   };
 
-  // ============= YILAN İÇİN SMOOTH EĞRİ NOKTALARINI OLUŞTUR =============
   const generateSmoothCurve = (positions: Point[]): Point[] => {
     if (positions.length < 2) return positions;
     
     const curvePoints: Point[] = [];
     
-    // Her segment çifti için Catmull-Rom spline hesapla
     for (let i = 0; i < positions.length - 1; i++) {
-      // Catmull-Rom için 4 nokta gerekli (önceki, başlangıç, bitiş, sonraki)
-      const p0 = positions[Math.max(0, i - 1)]; // Önceki (veya ilk nokta)
-      const p1 = positions[i]; // Başlangıç
-      const p2 = positions[i + 1]; // Bitiş
-      const p3 = positions[Math.min(positions.length - 1, i + 2)]; // Sonraki (veya son nokta)
+      const p0 = positions[Math.max(0, i - 1)];
+      const p1 = positions[i];
+      const p2 = positions[i + 1];
+      const p3 = positions[Math.min(positions.length - 1, i + 2)];
       
       const segmentCurve = catmullRomSpline(p0, p1, p2, p3);
       
-      // İlk segment için tüm noktaları ekle, sonraki segmentlerde çakışmayı önlemek için ilk noktayı atla
       if (i === 0) {
         curvePoints.push(...segmentCurve);
       } else {
@@ -141,70 +135,54 @@ function App() {
     return curvePoints;
   };
 
-  // ============= PERPENDİKÜLER (DİK) VEKTÖR HESAPLAMA =============
-  // Bir yön vektörüne dik olan vektörü bulur (sağ tarafa işaret eden)
   const getPerpendicular = (dx: number, dy: number): Point => {
-    // 2D'de dik vektör: (dx, dy) -> (-dy, dx)
-    const length = Math.sqrt(dx * dx + dy * dy) || 1; // Sıfıra bölme koruması
+    const length = Math.sqrt(dx * dx + dy * dy) || 1;
     return {
       x: -dy / length,
       y: dx / length,
     };
   };
 
-  // ============= NOKTA İÇİN KALINLIK HESAPLAMA (TAPERING) =============
-  // Baştan kuyruğa kalınlığın kademeli azalmasını hesaplar
   const getWidthAtPosition = (index: number, totalLength: number): number => {
-    // 0 (baş) ile 1 (kuyruk) arası normalleştirilmiş pozisyon
     const normalizedPos = index / Math.max(totalLength - 1, 1);
     
-    // Baştan %70'lik kısımda maksimum genişlik, sonra hızla incelt
     let widthFactor: number;
     if (normalizedPos < 0.7) {
-      widthFactor = 1.0; // Sabit maksimum genişlik
+      widthFactor = 1.0;
     } else {
-      // 0.7'den sonra lineer olarak 1'den 0.4'e düş
       widthFactor = 1.0 - ((normalizedPos - 0.7) / 0.3) * 0.6;
     }
     
     return SNAKE_BASE_WIDTH * widthFactor;
   };
 
-  // ============= TÜP ŞEKLİNDE YILAN GÖVDESİ ÇİZ =============
   const drawSnakeBody = (
     ctx: CanvasRenderingContext2D,
     curvePoints: Point[]
   ) => {
     if (curvePoints.length < 2) return;
     
-    // ===== ÜST VE ALT KENAR NOKTALARI HESAPLA =====
     const topEdge: Point[] = [];
     const bottomEdge: Point[] = [];
     
     for (let i = 0; i < curvePoints.length; i++) {
       const current = curvePoints[i];
       
-      // Yön vektörünü hesapla (bir sonraki noktaya doğru)
       let dx: number, dy: number;
       if (i < curvePoints.length - 1) {
         const next = curvePoints[i + 1];
         dx = next.x - current.x;
         dy = next.y - current.y;
       } else {
-        // Son nokta için önceki yönü kullan
         const prev = curvePoints[i - 1];
         dx = current.x - prev.x;
         dy = current.y - prev.y;
       }
       
-      // Dik vektör (perpendicular)
       const perp = getPerpendicular(dx, dy);
-      
-      // Bu noktadaki genişlik (tapering ile)
       const width = getWidthAtPosition(i, curvePoints.length);
       const halfWidth = width / 2;
       
-      // Üst ve alt kenar noktaları
       topEdge.push({
         x: current.x + perp.x * halfWidth,
         y: current.y + perp.y * halfWidth,
@@ -216,8 +194,6 @@ function App() {
       });
     }
     
-    // ===== RENK GRADİENTİ OLUŞTUR (BAŞTAN KUYRUĞA) =====
-    // Yılanın fiziksel baş ve kuyruk pozisyonlarını kullan
     const headPos = curvePoints[0];
     const tailPos = curvePoints[curvePoints.length - 1];
     
@@ -226,39 +202,27 @@ function App() {
       tailPos.x, tailPos.y
     );
     
-    gradient.addColorStop(0, COLORS.snakeHead);    // Baş: parlak yeşil
-    gradient.addColorStop(0.5, COLORS.snake);      // Orta: neon yeşil
-    gradient.addColorStop(1, COLORS.snakeTail);    // Kuyruk: koyu yeşil
+    gradient.addColorStop(0, COLORS.snakeHead);
+    gradient.addColorStop(0.5, COLORS.snake);
+    gradient.addColorStop(1, COLORS.snakeTail);
     
-    // ===== GLOW EFEKTİ =====
     ctx.shadowBlur = 15;
     ctx.shadowColor = COLORS.snake;
     
-    // ===== KAPALI PATH OLUŞTUR (TÜP ŞEKLİ) =====
     ctx.beginPath();
-    
-    // Üst kenarı çiz (baştan kuyruğa)
     ctx.moveTo(topEdge[0].x, topEdge[0].y);
     for (let i = 1; i < topEdge.length; i++) {
       ctx.lineTo(topEdge[i].x, topEdge[i].y);
     }
-    
-    // Alt kenarı çiz (kuyruktan başa - ters yönde)
     for (let i = bottomEdge.length - 1; i >= 0; i--) {
       ctx.lineTo(bottomEdge[i].x, bottomEdge[i].y);
     }
-    
-    // Path'i kapat (başlangıca dön)
     ctx.closePath();
     
-    // ===== TEK BİR ŞEKİL OLARAK DOLDUR =====
     ctx.fillStyle = gradient;
     ctx.fill();
-    
     ctx.shadowBlur = 0;
     
-    // ===== IŞIK EFEKTİ (HIGHLIGHT) =====
-    // Gövde üstünde parlak bir şerit (3D derinlik hissi)
     const highlightGradient = ctx.createLinearGradient(
       topEdge[0].x, topEdge[0].y - 5,
       topEdge[0].x, topEdge[0].y + 5
@@ -280,29 +244,23 @@ function App() {
     ctx.stroke();
   };
 
-  // ============= YILAN BAŞINI ÇİZ =============
   const drawSnakeHead = (
     ctx: CanvasRenderingContext2D,
     headPosition: Point,
     direction: Point
   ) => {
-    // Baş boyutu (gövdeden biraz daha büyük)
     const headWidth = SNAKE_BASE_WIDTH * 1.1;
     const headHeight = SNAKE_BASE_WIDTH * 0.9;
     
-    // ===== BAŞ OVAL ŞEKLİ =====
     ctx.save();
     ctx.translate(headPosition.x, headPosition.y);
     
-    // Hareket yönüne göre rotasyon hesapla
     const angle = Math.atan2(direction.y, direction.x);
     ctx.rotate(angle);
     
-    // Glow efekti
     ctx.shadowBlur = 20;
     ctx.shadowColor = COLORS.snakeHead;
     
-    // Gradient (3D derinlik)
     const headGradient = ctx.createRadialGradient(0, -2, 0, 0, 0, headWidth / 2);
     headGradient.addColorStop(0, COLORS.snakeHead);
     headGradient.addColorStop(1, COLORS.snake);
@@ -311,15 +269,12 @@ function App() {
     ctx.beginPath();
     ctx.ellipse(0, 0, headWidth / 2, headHeight / 2, 0, 0, Math.PI * 2);
     ctx.fill();
-    
     ctx.shadowBlur = 0;
     
-    // ===== GÖZLER =====
-    const eyeY = -headHeight * 0.15; // Gözlerin yukarıda olması için
+    const eyeY = -headHeight * 0.15;
     const eyeSpacing = headWidth * 0.3;
     const eyeSize = headWidth * 0.12;
     
-    // Sol göz
     ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
     ctx.beginPath();
     ctx.arc(-eyeSpacing, eyeY, eyeSize, 0, Math.PI * 2);
@@ -330,7 +285,6 @@ function App() {
     ctx.arc(-eyeSpacing + eyeSize * 0.2, eyeY, eyeSize * 0.6, 0, Math.PI * 2);
     ctx.fill();
     
-    // Sağ göz
     ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
     ctx.beginPath();
     ctx.arc(eyeSpacing, eyeY, eyeSize, 0, Math.PI * 2);
@@ -341,8 +295,6 @@ function App() {
     ctx.arc(eyeSpacing + eyeSize * 0.2, eyeY, eyeSize * 0.6, 0, Math.PI * 2);
     ctx.fill();
     
-    // ===== DİL (OPSIYONEL) =====
-    // Küçük V şeklinde kırmızı dil
     ctx.strokeStyle = 'rgba(220, 20, 60, 0.8)';
     ctx.lineWidth = 2;
     ctx.lineCap = 'round';
@@ -360,7 +312,7 @@ function App() {
     ctx.restore();
   };
 
-  // ============= BFS PATHFINDING =============
+  // ============= TEMEL BFS PATHFINDING =============
   const findPathBFS = (start: Point, target: Point, obstacles: Point[]): Point[] => {
     const pointToKey = (p: Point) => `${p.x},${p.y}`;
     const obstacleSet = new Set(obstacles.map(pointToKey));
@@ -391,10 +343,207 @@ function App() {
     return [];
   };
 
-  const checkCollision = (head: Point, body: Point[]): boolean => {
-    if (head.x < 0 || head.x >= GRID_WIDTH || head.y < 0 || head.y >= GRID_HEIGHT) return true;
+  // ============= FLOOD-FILL: ERİŞİLEBİLİR BOŞ ALAN SAYMA =============
+  const countReachableSpaces = (start: Point, obstacles: Point[]): number => {
+    const pointToKey = (p: Point) => `${p.x},${p.y}`;
+    const obstacleSet = new Set(obstacles.map(pointToKey));
+    
+    const queue: Point[] = [start];
+    const visited = new Set<string>([pointToKey(start)]);
+    let count = 0;
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      count++;
+
+      for (const dir of DIRECTIONS) {
+        const next = { x: current.x + dir.x, y: current.y + dir.y };
+        const nextKey = pointToKey(next);
+
+        if (
+          next.x >= 0 &&
+          next.x < GRID_WIDTH &&
+          next.y >= 0 &&
+          next.y < GRID_HEIGHT &&
+          !visited.has(nextKey) &&
+          !obstacleSet.has(nextKey)
+        ) {
+          visited.add(nextKey);
+          queue.push(next);
+        }
+      }
+    }
+
+    return count;
+  };
+
+  // ============= KATMAN 1: GELİŞTİRİLMİŞ GÜVENLİ YOL KONTROLÜ =============
+  // YENİ: ADIM ADIM GERÇEK SİMÜLASYON
+  const isSafeToEatFood = (
+    foodPath: Point[],
+    currentSnake: Point[]
+  ): boolean => {
+    if (foodPath.length < 2) return false;
+
+    // ===== ADIM ADIM SİMÜLASYON =====
+    // Yılanın yeme giderken her adımda nasıl değişeceğini gerçekçi şekilde simüle et
+    let simulatedSnake = [...currentSnake.map(p => ({ ...p }))];
+
+    // pathToFood dizisindeki her adımı takip et (ilk eleman mevcut konum, son eleman yem)
+    for (let i = 1; i < foodPath.length; i++) {
+      const nextHead = foodPath[i];
+      
+      // Yılanı hareket ettir
+      if (i < foodPath.length - 1) {
+        // Ara adımlar: baş ilerler, kuyruk kısalır (normal hareket)
+        simulatedSnake = [nextHead, ...simulatedSnake.slice(0, -1)];
+      } else {
+        // SON adım: yemi yiyoruz, kuyruk kısalmaz (yılan uzar)
+        simulatedSnake = [nextHead, ...simulatedSnake];
+      }
+    }
+
+    // Artık simulatedSnake = yemi yedikten SONRAKİ gerçekçi yılan durumu
+
+    // ===== KONTROL 1: Yeterince geniş alana mı erişiyoruz? =====
+    const newHead = simulatedSnake[0];
+    const obstaclesAfterEating = simulatedSnake.slice(1);
+    const reachableAfterEating = countReachableSpaces(newHead, obstaclesAfterEating);
+    const totalGridSpace = GRID_WIDTH * GRID_HEIGHT;
+    const reachableRatio = reachableAfterEating / totalGridSpace;
+    
+    // En az grid alanının %25'ine erişebilmeliyiz (esnek)
+    if (reachableRatio < MIN_SAFE_SPACE_RATIO) {
+      return false; // Çok dar alan, güvenli değil
+    }
+
+    // ===== KONTROL 2: Kuyruk bölgesine ulaşabiliyor muyuz? =====
+    const tailRegionSize = Math.min(TAIL_SAFE_DISTANCE, Math.floor(simulatedSnake.length * 0.2));
+    const tailRegionStart = Math.max(1, simulatedSnake.length - tailRegionSize);
+    
+    // Kuyruk bölgesindeki herhangi bir segmente ulaşabilir miyiz?
+    for (let i = tailRegionStart; i < simulatedSnake.length; i++) {
+      const tailTarget = simulatedSnake[i];
+      const obstaclesForTailCheck = [
+        ...simulatedSnake.slice(1, i),
+        ...simulatedSnake.slice(i + 1)
+      ];
+      
+      const pathToTailSegment = findPathBFS(newHead, tailTarget, obstaclesForTailCheck);
+      
+      if (pathToTailSegment.length > 0) {
+        // Kuyruk bölgesine ulaşabiliyoruz, GÜVENLİ!
+        return true;
+      }
+    }
+
+    // ===== KONTROL 3 (İYİLEŞTİRME): Erişilebilir alan yılan uzunluğunun %60'ından fazlaysa =====
+    // Bu, kuyruk kontrolü başarısız olsa bile geniş alanda olduğumuzu gösterir
+    if (reachableAfterEating >= simulatedSnake.length * 0.6) {
+      return true; // Çok geniş alan var, muhtemelen güvenli
+    }
+
+    return false;
+  };
+
+  // ============= KATMAN 2: KUYRUK TAKİP MODU =============
+  const findPathToTail = (head: Point, snake: Point[]): Point[] => {
+    if (snake.length < 2) return [];
+    
+    const tail = snake[snake.length - 1];
+    const obstacles = snake.slice(1, -1);
+    
+    return findPathBFS(head, tail, obstacles);
+  };
+
+  // ============= KATMAN 3: EN GÜVENLİ YÖN SEÇİMİ =============
+  const findSafestDirection = (head: Point, snake: Point[]): Point | null => {
+    const obstacles = snake.slice(1);
+    
+    let bestMove: Point | null = null;
+    let maxSpaces = -1;
+
+    for (const dir of DIRECTIONS) {
+      const nextPos = { x: head.x + dir.x, y: head.y + dir.y };
+      
+      if (
+        nextPos.x >= 0 &&
+        nextPos.x < GRID_WIDTH &&
+        nextPos.y >= 0 &&
+        nextPos.y < GRID_HEIGHT &&
+        !obstacles.some(seg => seg.x === nextPos.x && seg.y === nextPos.y)
+      ) {
+        const reachableSpaces = countReachableSpaces(nextPos, obstacles);
+        
+        if (reachableSpaces > maxSpaces) {
+          maxSpaces = reachableSpaces;
+          bestMove = nextPos;
+        }
+      }
+    }
+
+    return bestMove;
+  };
+
+  // ============= ANA KARAR MEKANİZMASI: 3 KATMANLI GÜVENLİK + SONSUZ DÖNGÜ ÖNLEYİCİ =============
+  const findSmartNextMove = (
+    head: Point,
+    food: Point,
+    snake: Point[],
+    tailChaseCount: number // Kaç tick'tir kuyruk takibindeyiz
+  ): Point | null => {
+    const body = snake.slice(1);
+
+    // ===== SONSUZ DÖNGÜ ÖNLEYİCİ (KRİTİK GÜVENLİK VALFİ) =====
+    // Eğer çok uzun süredir (MAX_TAIL_CHASE_TICKS) kuyruk takibindeyse,
+    // artık güvenlik kontrolünü atla ve ZORLA yeme git
+    const shouldForceEat = tailChaseCount > MAX_TAIL_CHASE_TICKS;
+
+    if (shouldForceEat) {
+      // Zorla yeme gitme modu: güvenlik kontrolü YOK
+      const pathToFood = findPathBFS(head, food, body);
+      if (pathToFood.length > 1) {
+        // Yeme giden yol var, direkt git (risk al, sonsuza dek beklemekten iyi)
+        return pathToFood[1];
+      }
+    }
+
+    // ===== KATMAN 1: YEME GÜVENLİ YOL VAR MI? =====
+    const pathToFood = findPathBFS(head, food, body);
+    
+    if (pathToFood.length > 1) {
+      // Yol bulundu, ama güvenli mi? (Gerçekçi adım adım simülasyon ile)
+      const isSafe = isSafeToEatFood(pathToFood, snake);
+      
+      if (isSafe) {
+        // GÜVENLİ! Yeme git
+        return pathToFood[1];
+      }
+    }
+
+    // ===== KATMAN 2: YEME GÜVENLİ YOL YOK, KUYRUĞU TAKİP ET =====
+    const pathToTail = findPathToTail(head, snake);
+    
+    if (pathToTail.length > 1) {
+      // Kuyruğa giden yol bulundu, onu takip et
+      return pathToTail[1];
+    }
+
+    // ===== KATMAN 3: SON ÇARE, EN GÜVENLİ YÖNÜ SEÇ =====
+    const safestMove = findSafestDirection(head, snake);
+    
+    if (safestMove) {
+      return safestMove;
+    }
+
+    return null;
+  };
+
+  // ============= DİĞER YARDIMCI FONKSİYONLAR =============
+  const checkCollision = (position: Point, body: Point[]): boolean => {
+    if (position.x < 0 || position.x >= GRID_WIDTH || position.y < 0 || position.y >= GRID_HEIGHT) return true;
     for (let i = 1; i < body.length; i++) {
-      if (head.x === body[i].x && head.y === body[i].y) return true;
+      if (position.x === body[i].x && position.y === body[i].y) return true;
     }
     return false;
   };
@@ -454,6 +603,7 @@ function App() {
       isGameOver: false,
       deathTime: 0,
       particles: [],
+      consecutiveTailChaseCount: 0, // Reset sayacı
     };
 
     setScore(0);
@@ -467,6 +617,7 @@ function App() {
     resetGame();
   }, []);
 
+  // ============= OYUN MANTIĞI DÖNGÜSÜ (GELİŞTİRİLMİŞ SİSTEM) =============
   useEffect(() => {
     const gameLogicInterval = setInterval(() => {
       const state = gameStateRef.current;
@@ -481,20 +632,43 @@ function App() {
       state.lastUpdateTime = performance.now();
 
       const head = state.snake[0];
-      const body = state.snake.slice(1);
-      const path = findPathBFS(head, state.food, body);
 
-      let nextPosition: Point;
-      if (path.length > 1) {
-        nextPosition = path[1];
-        state.direction = { x: nextPosition.x - head.x, y: nextPosition.y - head.y };
+      // ===== YENİ AKILLI KARAR MEKANİZMASI (SONSUZ DÖNGÜ ÖNLEYİCİ İLE) =====
+      const nextPosition = findSmartNextMove(
+        head, 
+        state.food, 
+        state.snake,
+        state.consecutiveTailChaseCount // Kuyruk takip sayacını gönder
+      );
+
+      const finalNextPosition = nextPosition || {
+        x: head.x + state.direction.x,
+        y: head.y + state.direction.y,
+      };
+
+      // ===== KUYRUK TAKİP SAYACI YÖNETİMİ =====
+      // Eğer yeme gidiyorsak sayacı sıfırla, kuyruk takibindeyse artır
+      const pathToFood = findPathBFS(head, state.food, state.snake.slice(1));
+      const isHeadingToFood = pathToFood.length > 1 && 
+        pathToFood[1].x === finalNextPosition.x && 
+        pathToFood[1].y === finalNextPosition.y;
+
+      if (isHeadingToFood || state.consecutiveTailChaseCount > MAX_TAIL_CHASE_TICKS) {
+        // Yeme gidiyor veya zorla yeme gönderildi, sayacı sıfırla
+        state.consecutiveTailChaseCount = 0;
       } else {
-        nextPosition = { x: head.x + state.direction.x, y: head.y + state.direction.y };
+        // Kuyruk takibi veya başka bir şey yapıyor, sayacı artır
+        state.consecutiveTailChaseCount++;
       }
 
-      const newSnake = [nextPosition, ...state.snake];
+      state.direction = {
+        x: finalNextPosition.x - head.x,
+        y: finalNextPosition.y - head.y,
+      };
 
-      if (checkCollision(nextPosition, state.snake)) {
+      const newSnake = [finalNextPosition, ...state.snake];
+
+      if (checkCollision(finalNextPosition, state.snake)) {
         state.isGameOver = true;
         state.deathTime = performance.now();
         state.particles = createFireParticles(state.snake);
@@ -502,7 +676,7 @@ function App() {
         return;
       }
 
-      if (nextPosition.x === state.food.x && nextPosition.y === state.food.y) {
+      if (finalNextPosition.x === state.food.x && finalNextPosition.y === state.food.y) {
         state.hasEaten = true;
         setScore(prev => prev + 1);
         state.food = generateFood(newSnake);
@@ -564,21 +738,18 @@ function App() {
     return () => cancelAnimationFrame(animationFrameId);
   }, [fps]);
 
-  // ============= ÇİZİM FONKSİYONU =============
   const drawGame = (
     ctx: CanvasRenderingContext2D, 
     state: typeof gameStateRef.current,
     interpolationFactor: number,
     currentTime: number
   ) => {
-    // Arka plan
     const gradient = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
     gradient.addColorStop(0, COLORS.background);
     gradient.addColorStop(1, COLORS.backgroundGradient);
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Grid
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
     ctx.lineWidth = 1;
     for (let x = 0; x <= CANVAS_WIDTH; x += CELL_SIZE) {
@@ -594,7 +765,6 @@ function App() {
       ctx.stroke();
     }
 
-    // Yem
     const foodX = state.food.x * CELL_SIZE;
     const foodY = state.food.y * CELL_SIZE;
     
@@ -606,10 +776,7 @@ function App() {
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // ========== PROFESYONEL YILAN ÇİZİMİ ==========
     if (!state.isGameOver && state.snake.length > 0) {
-      
-      // 1. İnterpolated grid pozisyonlarını piksel koordinatlarına çevir
       const interpolatedPositions = state.snake.map((segment, index) => {
         const prevSegment = state.previousSnake[index] || segment;
         const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
@@ -620,19 +787,14 @@ function App() {
         };
       });
 
-      // 2. Catmull-Rom spline ile smooth curve oluştur
       const smoothCurve = generateSmoothCurve(interpolatedPositions);
-
-      // 3. Tüp şeklinde gövde çiz
       drawSnakeBody(ctx, smoothCurve);
 
-      // 4. Baş çiz (en üstte, gövdeden ayrı)
       if (interpolatedPositions.length > 0) {
         drawSnakeHead(ctx, interpolatedPositions[0], state.direction);
       }
       
     } else if (state.isGameOver) {
-      // ========== YANMA EFEKTİ ==========
       const timeSinceDeath = currentTime - state.deathTime;
       const deathProgress = Math.min(timeSinceDeath / DEATH_ANIMATION_DURATION, 1);
 
@@ -691,11 +853,10 @@ function App() {
           🤖 AI Yılan Oyunu
         </h1>
         <p className="text-gray-300 text-sm">
-          BFS Pathfinding + Catmull-Rom Spline - Profesyonel Grafik
+          Gerçekçi Simülasyon + Sonsuz Döngü Önleyici
         </p>
       </div>
 
-      {/* HIZ KONTROL PANELİ */}
       <div className="mb-4 bg-gradient-to-r from-purple-600 via-purple-500 to-pink-500 p-1 rounded-xl shadow-2xl">
         <div className="bg-gray-900 bg-opacity-90 backdrop-blur-sm px-8 py-4 rounded-lg">
           <div className="flex items-center gap-6">
@@ -752,7 +913,6 @@ function App() {
         </div>
       </div>
 
-      {/* Oyun Canvas */}
       <div className="relative shadow-2xl rounded-lg overflow-hidden border-4 border-purple-500">
         <canvas
           ref={canvasRef}
@@ -762,7 +922,6 @@ function App() {
         />
       </div>
 
-      {/* Bilgi Paneli */}
       <div className="mt-6 bg-gray-800 bg-opacity-50 backdrop-blur-sm px-6 py-4 rounded-lg max-w-2xl">
         <div className="grid grid-cols-2 gap-4 text-white text-sm">
           <div>
@@ -778,24 +937,23 @@ function App() {
             <span className="ml-2 font-bold text-yellow-400">{fps}</span>
           </div>
           <div>
-            <span className="text-gray-400">Curve Res:</span>
-            <span className="ml-2 font-bold text-green-400">{CURVE_RESOLUTION}pts</span>
+            <span className="text-gray-400">Döngü Koruması:</span>
+            <span className="ml-2 font-bold text-green-400">{MAX_TAIL_CHASE_TICKS} tick</span>
           </div>
         </div>
         <div className="mt-4 text-center text-gray-400 text-xs">
-          🧠 BFS pathfinding + Catmull-Rom spline ile profesyonel smooth animasyon
+          🧠 <strong>Adım Adım Simülasyon:</strong> Yılanın tüm yolu gerçekçi şekilde simüle edilir
         </div>
         <div className="mt-2 text-center text-green-400 text-xs font-semibold">
-          ✨ Tüp şeklinde tek parça gövde, tapering efekti, highlight ışığı
+          ✨ Sonsuz Döngü Önleyici: {MAX_TAIL_CHASE_TICKS} tick kuyruk takibinden sonra ZORLA yeme gider
         </div>
         <div className="mt-2 text-center text-orange-400 text-xs">
-          💥 Duvara veya kendi gövdesine çarparsa otomatik yeniden başlar
+          💡 3 kontrol: Alan (≥{(MIN_SAFE_SPACE_RATIO * 100).toFixed(0)}%) + Kuyruk bölgesi + Geniş alan bonusu
         </div>
       </div>
 
-      {/* Kontroller */}
       <div className="mt-4 text-gray-400 text-xs text-center max-w-md">
-        <p>🎮 Oyun tamamen otomatik - AI kendi yolunu bulur!</p>
+        <p>🎮 Oyun tamamen otomatik - AI artık gerçekçi düşünüyor!</p>
         <p className="mt-1">⚡ Yukarıdaki butonlarla oyun hızını canlı olarak değiştirin</p>
       </div>
     </div>
