@@ -13,8 +13,12 @@ const MAX_FPS = 60;
 const FPS_STEP = 5;
 
 // Oyun ayarları
-const DEATH_ANIMATION_DURATION = 1500; // Yanma efekti süresi (ms)
-const RESET_DELAY = 2000; // Yanma sonrası reset bekleme süresi (ms)
+const DEATH_ANIMATION_DURATION = 1500;
+const RESET_DELAY = 2000;
+
+// Yılan görsel ayarları
+const SNAKE_BASE_WIDTH = CELL_SIZE * 0.9; // Baş için maksimum genişlik
+const CURVE_RESOLUTION = 6; // Her segment arası kaç ara nokta (performance için ayarlanabilir)
 
 // Renkler
 const COLORS = {
@@ -22,11 +26,10 @@ const COLORS = {
   backgroundGradient: '#16213e',
   snake: '#00ff88',
   snakeHead: '#00cc6a',
-  snakeTail: '#006644', // Kuyruk için daha koyu ton
+  snakeTail: '#006644',
   food: '#ff0066',
   text: '#ffffff',
   scoreGlow: '#ffd700',
-  // Yanma efekti renkleri
   fire: ['#ff0000', '#ff4500', '#ff6600', '#ff8800', '#ffaa00', '#ffdd00'],
 };
 
@@ -35,7 +38,6 @@ interface Point {
   y: number;
 }
 
-// Parçacık sistemi için
 interface Particle {
   x: number;
   y: number;
@@ -46,29 +48,26 @@ interface Particle {
   size: number;
 }
 
-// Yön vektörleri (yukarı, sağ, aşağı, sol)
 const DIRECTIONS = [
-  { x: 0, y: -1 }, // Yukarı
-  { x: 1, y: 0 },  // Sağ
-  { x: 0, y: 1 },  // Aşağı
-  { x: -1, y: 0 }, // Sol
+  { x: 0, y: -1 },
+  { x: 1, y: 0 },
+  { x: 0, y: 1 },
+  { x: -1, y: 0 },
 ];
 
 function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   
-  // State'ler korunuyor ama UI'da gösterilmeyecek
   const [score, setScore] = useState(0);
   const [highScore, setHighScore] = useState(0);
   const [, setGameCount] = useState(1);
   const [fps, setFps] = useState(15);
   
-  // Oyun state'i
   const gameStateRef = useRef({
     snake: [{ x: 20, y: 15 }],
     previousSnake: [{ x: 20, y: 15 }],
     food: { x: 10, y: 10 },
-    direction: { x: 1, y: 0 }, // Başlangıç yönü: sağa
+    direction: { x: 1, y: 0 },
     hasEaten: false,
     lastUpdateTime: 0,
     isGameOver: false,
@@ -76,20 +75,301 @@ function App() {
     particles: [] as Particle[],
   });
 
-  // ============= BFS PATHFINDING ALGORİTMASI =============
+  // ============= CATMULL-ROM SPLINE HESAPLAMA =============
+  // Verilen kontrol noktaları arasından geçen yumuşak bir eğri oluşturur
+  const catmullRomSpline = (
+    p0: Point,  // Önceki nokta
+    p1: Point,  // Başlangıç noktası
+    p2: Point,  // Bitiş noktası
+    p3: Point,  // Sonraki nokta
+    segments: number = CURVE_RESOLUTION // Kaç ara nokta oluşturulacak
+  ): Point[] => {
+    const points: Point[] = [];
+    
+    // 0'dan 1'e kadar küçük adımlarla ilerle
+    for (let i = 0; i <= segments; i++) {
+      const t = i / segments; // 0-1 arası interpolasyon faktörü
+      const t2 = t * t;
+      const t3 = t2 * t;
+      
+      // Catmull-Rom formülü (tension = 0.5 için)
+      // Her eksen için ayrı hesaplama
+      const x = 0.5 * (
+        2 * p1.x +
+        (-p0.x + p2.x) * t +
+        (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+        (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3
+      );
+      
+      const y = 0.5 * (
+        2 * p1.y +
+        (-p0.y + p2.y) * t +
+        (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+        (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3
+      );
+      
+      points.push({ x, y });
+    }
+    
+    return points;
+  };
+
+  // ============= YILAN İÇİN SMOOTH EĞRİ NOKTALARINI OLUŞTUR =============
+  const generateSmoothCurve = (positions: Point[]): Point[] => {
+    if (positions.length < 2) return positions;
+    
+    const curvePoints: Point[] = [];
+    
+    // Her segment çifti için Catmull-Rom spline hesapla
+    for (let i = 0; i < positions.length - 1; i++) {
+      // Catmull-Rom için 4 nokta gerekli (önceki, başlangıç, bitiş, sonraki)
+      const p0 = positions[Math.max(0, i - 1)]; // Önceki (veya ilk nokta)
+      const p1 = positions[i]; // Başlangıç
+      const p2 = positions[i + 1]; // Bitiş
+      const p3 = positions[Math.min(positions.length - 1, i + 2)]; // Sonraki (veya son nokta)
+      
+      const segmentCurve = catmullRomSpline(p0, p1, p2, p3);
+      
+      // İlk segment için tüm noktaları ekle, sonraki segmentlerde çakışmayı önlemek için ilk noktayı atla
+      if (i === 0) {
+        curvePoints.push(...segmentCurve);
+      } else {
+        curvePoints.push(...segmentCurve.slice(1));
+      }
+    }
+    
+    return curvePoints;
+  };
+
+  // ============= PERPENDİKÜLER (DİK) VEKTÖR HESAPLAMA =============
+  // Bir yön vektörüne dik olan vektörü bulur (sağ tarafa işaret eden)
+  const getPerpendicular = (dx: number, dy: number): Point => {
+    // 2D'de dik vektör: (dx, dy) -> (-dy, dx)
+    const length = Math.sqrt(dx * dx + dy * dy) || 1; // Sıfıra bölme koruması
+    return {
+      x: -dy / length,
+      y: dx / length,
+    };
+  };
+
+  // ============= NOKTA İÇİN KALINLIK HESAPLAMA (TAPERING) =============
+  // Baştan kuyruğa kalınlığın kademeli azalmasını hesaplar
+  const getWidthAtPosition = (index: number, totalLength: number): number => {
+    // 0 (baş) ile 1 (kuyruk) arası normalleştirilmiş pozisyon
+    const normalizedPos = index / Math.max(totalLength - 1, 1);
+    
+    // Baştan %70'lik kısımda maksimum genişlik, sonra hızla incelt
+    let widthFactor: number;
+    if (normalizedPos < 0.7) {
+      widthFactor = 1.0; // Sabit maksimum genişlik
+    } else {
+      // 0.7'den sonra lineer olarak 1'den 0.4'e düş
+      widthFactor = 1.0 - ((normalizedPos - 0.7) / 0.3) * 0.6;
+    }
+    
+    return SNAKE_BASE_WIDTH * widthFactor;
+  };
+
+  // ============= TÜP ŞEKLİNDE YILAN GÖVDESİ ÇİZ =============
+  const drawSnakeBody = (
+    ctx: CanvasRenderingContext2D,
+    curvePoints: Point[]
+  ) => {
+    if (curvePoints.length < 2) return;
+    
+    // ===== ÜST VE ALT KENAR NOKTALARI HESAPLA =====
+    const topEdge: Point[] = [];
+    const bottomEdge: Point[] = [];
+    
+    for (let i = 0; i < curvePoints.length; i++) {
+      const current = curvePoints[i];
+      
+      // Yön vektörünü hesapla (bir sonraki noktaya doğru)
+      let dx: number, dy: number;
+      if (i < curvePoints.length - 1) {
+        const next = curvePoints[i + 1];
+        dx = next.x - current.x;
+        dy = next.y - current.y;
+      } else {
+        // Son nokta için önceki yönü kullan
+        const prev = curvePoints[i - 1];
+        dx = current.x - prev.x;
+        dy = current.y - prev.y;
+      }
+      
+      // Dik vektör (perpendicular)
+      const perp = getPerpendicular(dx, dy);
+      
+      // Bu noktadaki genişlik (tapering ile)
+      const width = getWidthAtPosition(i, curvePoints.length);
+      const halfWidth = width / 2;
+      
+      // Üst ve alt kenar noktaları
+      topEdge.push({
+        x: current.x + perp.x * halfWidth,
+        y: current.y + perp.y * halfWidth,
+      });
+      
+      bottomEdge.push({
+        x: current.x - perp.x * halfWidth,
+        y: current.y - perp.y * halfWidth,
+      });
+    }
+    
+    // ===== RENK GRADİENTİ OLUŞTUR (BAŞTAN KUYRUĞA) =====
+    // Yılanın fiziksel baş ve kuyruk pozisyonlarını kullan
+    const headPos = curvePoints[0];
+    const tailPos = curvePoints[curvePoints.length - 1];
+    
+    const gradient = ctx.createLinearGradient(
+      headPos.x, headPos.y,
+      tailPos.x, tailPos.y
+    );
+    
+    gradient.addColorStop(0, COLORS.snakeHead);    // Baş: parlak yeşil
+    gradient.addColorStop(0.5, COLORS.snake);      // Orta: neon yeşil
+    gradient.addColorStop(1, COLORS.snakeTail);    // Kuyruk: koyu yeşil
+    
+    // ===== GLOW EFEKTİ =====
+    ctx.shadowBlur = 15;
+    ctx.shadowColor = COLORS.snake;
+    
+    // ===== KAPALI PATH OLUŞTUR (TÜP ŞEKLİ) =====
+    ctx.beginPath();
+    
+    // Üst kenarı çiz (baştan kuyruğa)
+    ctx.moveTo(topEdge[0].x, topEdge[0].y);
+    for (let i = 1; i < topEdge.length; i++) {
+      ctx.lineTo(topEdge[i].x, topEdge[i].y);
+    }
+    
+    // Alt kenarı çiz (kuyruktan başa - ters yönde)
+    for (let i = bottomEdge.length - 1; i >= 0; i--) {
+      ctx.lineTo(bottomEdge[i].x, bottomEdge[i].y);
+    }
+    
+    // Path'i kapat (başlangıca dön)
+    ctx.closePath();
+    
+    // ===== TEK BİR ŞEKİL OLARAK DOLDUR =====
+    ctx.fillStyle = gradient;
+    ctx.fill();
+    
+    ctx.shadowBlur = 0;
+    
+    // ===== IŞIK EFEKTİ (HIGHLIGHT) =====
+    // Gövde üstünde parlak bir şerit (3D derinlik hissi)
+    const highlightGradient = ctx.createLinearGradient(
+      topEdge[0].x, topEdge[0].y - 5,
+      topEdge[0].x, topEdge[0].y + 5
+    );
+    
+    highlightGradient.addColorStop(0, 'rgba(255, 255, 255, 0)');
+    highlightGradient.addColorStop(0.5, 'rgba(255, 255, 255, 0.3)');
+    highlightGradient.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    
+    ctx.beginPath();
+    ctx.moveTo(topEdge[0].x, topEdge[0].y);
+    for (let i = 1; i < topEdge.length; i++) {
+      ctx.lineTo(topEdge[i].x, topEdge[i].y);
+    }
+    
+    ctx.strokeStyle = highlightGradient;
+    ctx.lineWidth = 3;
+    ctx.lineCap = 'round';
+    ctx.stroke();
+  };
+
+  // ============= YILAN BAŞINI ÇİZ =============
+  const drawSnakeHead = (
+    ctx: CanvasRenderingContext2D,
+    headPosition: Point,
+    direction: Point
+  ) => {
+    // Baş boyutu (gövdeden biraz daha büyük)
+    const headWidth = SNAKE_BASE_WIDTH * 1.1;
+    const headHeight = SNAKE_BASE_WIDTH * 0.9;
+    
+    // ===== BAŞ OVAL ŞEKLİ =====
+    ctx.save();
+    ctx.translate(headPosition.x, headPosition.y);
+    
+    // Hareket yönüne göre rotasyon hesapla
+    const angle = Math.atan2(direction.y, direction.x);
+    ctx.rotate(angle);
+    
+    // Glow efekti
+    ctx.shadowBlur = 20;
+    ctx.shadowColor = COLORS.snakeHead;
+    
+    // Gradient (3D derinlik)
+    const headGradient = ctx.createRadialGradient(0, -2, 0, 0, 0, headWidth / 2);
+    headGradient.addColorStop(0, COLORS.snakeHead);
+    headGradient.addColorStop(1, COLORS.snake);
+    
+    ctx.fillStyle = headGradient;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, headWidth / 2, headHeight / 2, 0, 0, Math.PI * 2);
+    ctx.fill();
+    
+    ctx.shadowBlur = 0;
+    
+    // ===== GÖZLER =====
+    const eyeY = -headHeight * 0.15; // Gözlerin yukarıda olması için
+    const eyeSpacing = headWidth * 0.3;
+    const eyeSize = headWidth * 0.12;
+    
+    // Sol göz
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.beginPath();
+    ctx.arc(-eyeSpacing, eyeY, eyeSize, 0, Math.PI * 2);
+    ctx.fill();
+    
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    ctx.beginPath();
+    ctx.arc(-eyeSpacing + eyeSize * 0.2, eyeY, eyeSize * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // Sağ göz
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.95)';
+    ctx.beginPath();
+    ctx.arc(eyeSpacing, eyeY, eyeSize, 0, Math.PI * 2);
+    ctx.fill();
+    
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
+    ctx.beginPath();
+    ctx.arc(eyeSpacing + eyeSize * 0.2, eyeY, eyeSize * 0.6, 0, Math.PI * 2);
+    ctx.fill();
+    
+    // ===== DİL (OPSIYONEL) =====
+    // Küçük V şeklinde kırmızı dil
+    ctx.strokeStyle = 'rgba(220, 20, 60, 0.8)';
+    ctx.lineWidth = 2;
+    ctx.lineCap = 'round';
+    
+    const tongueLength = headWidth * 0.4;
+    const tongueSplit = headWidth * 0.15;
+    
+    ctx.beginPath();
+    ctx.moveTo(headWidth / 2, 0);
+    ctx.lineTo(headWidth / 2 + tongueLength - tongueSplit, -tongueSplit);
+    ctx.moveTo(headWidth / 2, 0);
+    ctx.lineTo(headWidth / 2 + tongueLength - tongueSplit, tongueSplit);
+    ctx.stroke();
+    
+    ctx.restore();
+  };
+
+  // ============= BFS PATHFINDING =============
   const findPathBFS = (start: Point, target: Point, obstacles: Point[]): Point[] => {
     const pointToKey = (p: Point) => `${p.x},${p.y}`;
-
     const obstacleSet = new Set(obstacles.map(pointToKey));
     const queue: { point: Point; path: Point[] }[] = [{ point: start, path: [start] }];
     const visited = new Set<string>([pointToKey(start)]);
 
     while (queue.length > 0) {
       const { point, path } = queue.shift()!;
-
-      if (point.x === target.x && point.y === target.y) {
-        return path;
-      }
+      if (point.x === target.x && point.y === target.y) return path;
 
       for (const dir of DIRECTIONS) {
         const nextPoint = { x: point.x + dir.x, y: point.y + dir.y };
@@ -104,36 +384,23 @@ function App() {
           !obstacleSet.has(nextKey)
         ) {
           visited.add(nextKey);
-          queue.push({
-            point: nextPoint,
-            path: [...path, nextPoint],
-          });
+          queue.push({ point: nextPoint, path: [...path, nextPoint] });
         }
       }
     }
-
     return [];
   };
 
-  // ============= ÇARPIŞMA KONTROLÜ =============
   const checkCollision = (head: Point, body: Point[]): boolean => {
-    if (head.x < 0 || head.x >= GRID_WIDTH || head.y < 0 || head.y >= GRID_HEIGHT) {
-      return true;
-    }
-
+    if (head.x < 0 || head.x >= GRID_WIDTH || head.y < 0 || head.y >= GRID_HEIGHT) return true;
     for (let i = 1; i < body.length; i++) {
-      if (head.x === body[i].x && head.y === body[i].y) {
-        return true;
-      }
+      if (head.x === body[i].x && head.y === body[i].y) return true;
     }
-
     return false;
   };
 
-  // ============= YANMA EFEKTİ PARÇACIK OLUŞTURMA =============
   const createFireParticles = (snakeBody: Point[]): Particle[] => {
     const particles: Particle[] = [];
-
     snakeBody.forEach((segment) => {
       const particleCount = 8;
       for (let i = 0; i < particleCount; i++) {
@@ -150,11 +417,9 @@ function App() {
         });
       }
     });
-
     return particles;
   };
 
-  // ============= RASTGELE YEM KONUMU =============
   const generateFood = (snake: Point[]): Point => {
     let newFood: Point;
     let attempts = 0;
@@ -174,11 +439,9 @@ function App() {
     return newFood;
   };
 
-  // ============= OYUNU SIFIRLAMA =============
   const resetGame = () => {
     const startX = Math.floor(GRID_WIDTH / 4 + Math.random() * (GRID_WIDTH / 2));
     const startY = Math.floor(GRID_HEIGHT / 4 + Math.random() * (GRID_HEIGHT / 2));
-    
     const initialSnake = [{ x: startX, y: startY }];
     
     gameStateRef.current = {
@@ -197,30 +460,20 @@ function App() {
     setGameCount(prev => prev + 1);
   };
 
-  // FPS kontrol fonksiyonları
-  const decreaseFps = () => {
-    setFps(prev => Math.max(MIN_FPS, prev - FPS_STEP));
-  };
+  const decreaseFps = () => setFps(prev => Math.max(MIN_FPS, prev - FPS_STEP));
+  const increaseFps = () => setFps(prev => Math.min(MAX_FPS, prev + FPS_STEP));
 
-  const increaseFps = () => {
-    setFps(prev => Math.min(MAX_FPS, prev + FPS_STEP));
-  };
-
-  // ============= OYUNU BAŞLAT =============
   useEffect(() => {
     resetGame();
   }, []);
 
-  // ============= OYUN MANTIĞI DÖNGÜSÜ =============
   useEffect(() => {
     const gameLogicInterval = setInterval(() => {
       const state = gameStateRef.current;
 
       if (state.isGameOver) {
         const timeSinceDeath = performance.now() - state.deathTime;
-        if (timeSinceDeath > RESET_DELAY) {
-          resetGame();
-        }
+        if (timeSinceDeath > RESET_DELAY) resetGame();
         return;
       }
 
@@ -229,22 +482,14 @@ function App() {
 
       const head = state.snake[0];
       const body = state.snake.slice(1);
-
       const path = findPathBFS(head, state.food, body);
 
       let nextPosition: Point;
-
       if (path.length > 1) {
         nextPosition = path[1];
-        state.direction = {
-          x: nextPosition.x - head.x,
-          y: nextPosition.y - head.y,
-        };
+        state.direction = { x: nextPosition.x - head.x, y: nextPosition.y - head.y };
       } else {
-        nextPosition = {
-          x: head.x + state.direction.x,
-          y: head.y + state.direction.y,
-        };
+        nextPosition = { x: head.x + state.direction.x, y: head.y + state.direction.y };
       }
 
       const newSnake = [nextPosition, ...state.snake];
@@ -253,11 +498,7 @@ function App() {
         state.isGameOver = true;
         state.deathTime = performance.now();
         state.particles = createFireParticles(state.snake);
-        
-        if (score > highScore) {
-          setHighScore(score);
-        }
-        
+        if (score > highScore) setHighScore(score);
         return;
       }
 
@@ -276,19 +517,15 @@ function App() {
         state.hasEaten = false;
       }
 
-      while (state.previousSnake.length > state.snake.length) {
-        state.previousSnake.pop();
-      }
+      while (state.previousSnake.length > state.snake.length) state.previousSnake.pop();
       while (state.previousSnake.length < state.snake.length) {
         state.previousSnake.push({ ...state.snake[state.snake.length - 1] });
       }
-      
     }, 1000 / fps);
 
     return () => clearInterval(gameLogicInterval);
   }, [fps, score, highScore]);
 
-  // ============= RENDER DÖNGÜSÜ (60 FPS) =============
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -320,15 +557,11 @@ function App() {
       const interpolationFactor = Math.min(timeSinceUpdate / updateInterval, 1);
       
       drawGame(ctx, state, interpolationFactor, now);
-      
       animationFrameId = requestAnimationFrame(renderLoop);
     };
     
     renderLoop();
-    
-    return () => {
-      cancelAnimationFrame(animationFrameId);
-    };
+    return () => cancelAnimationFrame(animationFrameId);
   }, [fps]);
 
   // ============= ÇİZİM FONKSİYONU =============
@@ -338,14 +571,14 @@ function App() {
     interpolationFactor: number,
     currentTime: number
   ) => {
-    // Arka plan gradient
+    // Arka plan
     const gradient = ctx.createLinearGradient(0, 0, 0, CANVAS_HEIGHT);
     gradient.addColorStop(0, COLORS.background);
     gradient.addColorStop(1, COLORS.backgroundGradient);
     ctx.fillStyle = gradient;
     ctx.fillRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
 
-    // Grid çizgileri
+    // Grid
     ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
     ctx.lineWidth = 1;
     for (let x = 0; x <= CANVAS_WIDTH; x += CELL_SIZE) {
@@ -361,7 +594,7 @@ function App() {
       ctx.stroke();
     }
 
-    // Yem çiz
+    // Yem
     const foodX = state.food.x * CELL_SIZE;
     const foodY = state.food.y * CELL_SIZE;
     
@@ -369,169 +602,37 @@ function App() {
     ctx.shadowColor = COLORS.food;
     ctx.fillStyle = COLORS.food;
     ctx.beginPath();
-    ctx.arc(
-      foodX + CELL_SIZE / 2,
-      foodY + CELL_SIZE / 2,
-      CELL_SIZE / 2 - 2,
-      0,
-      Math.PI * 2
-    );
+    ctx.arc(foodX + CELL_SIZE / 2, foodY + CELL_SIZE / 2, CELL_SIZE / 2 - 2, 0, Math.PI * 2);
     ctx.fill();
     ctx.shadowBlur = 0;
 
-    // ========== YENİ YILAN ÇİZİMİ - TEK PARÇA AKICI GÖVDE ==========
+    // ========== PROFESYONEL YILAN ÇİZİMİ ==========
     if (!state.isGameOver && state.snake.length > 0) {
       
-      // Interpolated pozisyonları hesapla
+      // 1. İnterpolated grid pozisyonlarını piksel koordinatlarına çevir
       const interpolatedPositions = state.snake.map((segment, index) => {
         const prevSegment = state.previousSnake[index] || segment;
         const lerpX = prevSegment.x + (segment.x - prevSegment.x) * interpolationFactor;
         const lerpY = prevSegment.y + (segment.y - prevSegment.y) * interpolationFactor;
         return {
-          x: lerpX * CELL_SIZE + CELL_SIZE / 2, // Merkez nokta
+          x: lerpX * CELL_SIZE + CELL_SIZE / 2,
           y: lerpY * CELL_SIZE + CELL_SIZE / 2,
         };
       });
 
-      // ===== YILAN GÖVDESİNİ ÇİZ (Smooth Path ile) =====
-      const bodyWidth = CELL_SIZE * 0.9; // Gövde kalınlığı
-      
-      // Her segment için daire çiz (örtüşmeli)
-      for (let i = state.snake.length - 1; i >= 0; i--) {
-        const pos = interpolatedPositions[i];
-        
-        // Baştan kuyruğa renk gradient'i
-        const colorProgress = i / Math.max(state.snake.length - 1, 1);
-        const r1 = parseInt(COLORS.snakeHead.slice(1, 3), 16);
-        const g1 = parseInt(COLORS.snakeHead.slice(3, 5), 16);
-        const b1 = parseInt(COLORS.snakeHead.slice(5, 7), 16);
-        
-        const r2 = parseInt(COLORS.snakeTail.slice(1, 3), 16);
-        const g2 = parseInt(COLORS.snakeTail.slice(3, 5), 16);
-        const b2 = parseInt(COLORS.snakeTail.slice(5, 7), 16);
-        
-        const r = Math.round(r1 + (r2 - r1) * colorProgress);
-        const g = Math.round(g1 + (g2 - g1) * colorProgress);
-        const b = Math.round(b1 + (b2 - b1) * colorProgress);
-        
-        const segmentColor = `rgb(${r}, ${g}, ${b})`;
-        
-        // Glow efekti
-        ctx.shadowBlur = i === 0 ? 15 : 8;
-        ctx.shadowColor = i === 0 ? COLORS.snakeHead : COLORS.snake;
-        
-        // Segment dairesi
-        ctx.fillStyle = segmentColor;
-        ctx.beginPath();
-        ctx.arc(pos.x, pos.y, bodyWidth / 2, 0, Math.PI * 2);
-        ctx.fill();
-      }
-      
-      ctx.shadowBlur = 0;
-      
-      // ===== SEGMENTLER ARASI BAĞLANTI ÇİZGİLERİ =====
-      // Segmentler arası boşlukları doldur
-      for (let i = 0; i < interpolatedPositions.length - 1; i++) {
-        const pos1 = interpolatedPositions[i];
-        const pos2 = interpolatedPositions[i + 1];
-        
-        // Renk gradient'i
-        const colorProgress = i / Math.max(state.snake.length - 1, 1);
-        const r1 = parseInt(COLORS.snakeHead.slice(1, 3), 16);
-        const g1 = parseInt(COLORS.snakeHead.slice(3, 5), 16);
-        const b1 = parseInt(COLORS.snakeHead.slice(5, 7), 16);
-        
-        const r2 = parseInt(COLORS.snakeTail.slice(1, 3), 16);
-        const g2 = parseInt(COLORS.snakeTail.slice(3, 5), 16);
-        const b2 = parseInt(COLORS.snakeTail.slice(5, 7), 16);
-        
-        const r = Math.round(r1 + (r2 - r1) * colorProgress);
-        const g = Math.round(g1 + (g2 - g1) * colorProgress);
-        const b = Math.round(b1 + (b2 - b1) * colorProgress);
-        
-        ctx.strokeStyle = `rgb(${r}, ${g}, ${b})`;
-        ctx.lineWidth = bodyWidth;
-        ctx.lineCap = 'round';
-        ctx.lineJoin = 'round';
-        
-        ctx.beginPath();
-        ctx.moveTo(pos1.x, pos1.y);
-        ctx.lineTo(pos2.x, pos2.y);
-        ctx.stroke();
-      }
-      
-      // ===== PUL DESENİ (Scale Pattern) =====
-      // Hafif çizgiler ile pul efekti
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.15)';
-      ctx.lineWidth = 1.5;
-      for (let i = 0; i < interpolatedPositions.length; i++) {
-        const pos = interpolatedPositions[i];
-        
-        // Her segment için 2-3 küçük çizgi (pul görünümü)
-        const scaleSize = bodyWidth * 0.3;
-        for (let j = 0; j < 3; j++) {
-          const angle = (Math.PI * 2 / 3) * j + i * 0.5;
-          const x1 = pos.x + Math.cos(angle) * scaleSize * 0.5;
-          const y1 = pos.y + Math.sin(angle) * scaleSize * 0.5;
-          const x2 = pos.x + Math.cos(angle) * scaleSize;
-          const y2 = pos.y + Math.sin(angle) * scaleSize;
-          
-          ctx.beginPath();
-          ctx.moveTo(x1, y1);
-          ctx.lineTo(x2, y2);
-          ctx.stroke();
-        }
-      }
-      
-      // ===== YILAN BAŞINA GÖZLER EKLE =====
+      // 2. Catmull-Rom spline ile smooth curve oluştur
+      const smoothCurve = generateSmoothCurve(interpolatedPositions);
+
+      // 3. Tüp şeklinde gövde çiz
+      drawSnakeBody(ctx, smoothCurve);
+
+      // 4. Baş çiz (en üstte, gövdeden ayrı)
       if (interpolatedPositions.length > 0) {
-        const headPos = interpolatedPositions[0];
-        const direction = state.direction;
-        
-        // Gözlerin pozisyonunu hareket yönüne göre ayarla
-        const eyeDistance = bodyWidth * 0.35;
-        
-        // Yön vektörüne dik vektör (gözler yan yana olsun)
-        const perpX = -direction.y;
-        const perpY = direction.x;
-        
-        // İlerleme yönünde gözleri biraz öne al
-        const forwardOffset = bodyWidth * 0.15;
-        
-        // İki göz pozisyonu
-        const eye1X = headPos.x + direction.x * forwardOffset + perpX * eyeDistance;
-        const eye1Y = headPos.y + direction.y * forwardOffset + perpY * eyeDistance;
-        const eye2X = headPos.x + direction.x * forwardOffset - perpX * eyeDistance;
-        const eye2Y = headPos.y + direction.y * forwardOffset - perpY * eyeDistance;
-        
-        // Göz çiz (beyaz dış, siyah iç)
-        const eyeSize = bodyWidth * 0.15;
-        
-        // Sol göz
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-        ctx.beginPath();
-        ctx.arc(eye1X, eye1Y, eyeSize, 0, Math.PI * 2);
-        ctx.fill();
-        
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-        ctx.beginPath();
-        ctx.arc(eye1X, eye1Y, eyeSize * 0.6, 0, Math.PI * 2);
-        ctx.fill();
-        
-        // Sağ göz
-        ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
-        ctx.beginPath();
-        ctx.arc(eye2X, eye2Y, eyeSize, 0, Math.PI * 2);
-        ctx.fill();
-        
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.8)';
-        ctx.beginPath();
-        ctx.arc(eye2X, eye2Y, eyeSize * 0.6, 0, Math.PI * 2);
-        ctx.fill();
+        drawSnakeHead(ctx, interpolatedPositions[0], state.direction);
       }
       
     } else if (state.isGameOver) {
-      // ========== YANMA EFEKTİ ÇİZİMİ ==========
+      // ========== YANMA EFEKTİ ==========
       const timeSinceDeath = currentTime - state.deathTime;
       const deathProgress = Math.min(timeSinceDeath / DEATH_ANIMATION_DURATION, 1);
 
@@ -541,7 +642,6 @@ function App() {
 
         const fireColorIndex = Math.floor((1 - deathProgress) * (COLORS.fire.length - 1));
         ctx.fillStyle = COLORS.fire[fireColorIndex];
-        
         ctx.shadowBlur = 30 * (1 - deathProgress);
         ctx.shadowColor = '#ff4500';
         
@@ -549,13 +649,7 @@ function App() {
         const offset = CELL_SIZE * (1 - shrinkFactor) / 2;
 
         ctx.beginPath();
-        ctx.roundRect(
-          x + offset, 
-          y + offset, 
-          CELL_SIZE * shrinkFactor, 
-          CELL_SIZE * shrinkFactor, 
-          4
-        );
+        ctx.roundRect(x + offset, y + offset, CELL_SIZE * shrinkFactor, CELL_SIZE * shrinkFactor, 4);
         ctx.fill();
       });
 
@@ -571,26 +665,20 @@ function App() {
 
       ctx.globalAlpha = 1;
 
-      // GAME OVER YAZISI
       if (timeSinceDeath < 1000) {
         ctx.save();
-        
         const scale = Math.min(timeSinceDeath / 200, 1);
         const opacity = 1 - Math.max((timeSinceDeath - 800) / 200, 0);
-        
         ctx.globalAlpha = opacity;
         ctx.translate(CANVAS_WIDTH / 2, CANVAS_HEIGHT / 2);
         ctx.scale(scale, scale);
-        
         ctx.shadowBlur = 40;
         ctx.shadowColor = '#ff0000';
-        
         ctx.fillStyle = '#ff0000';
         ctx.font = 'bold 80px Arial';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillText('💥 ÇARPTI!', 0, 0);
-        
         ctx.restore();
       }
     }
@@ -603,11 +691,9 @@ function App() {
           🤖 AI Yılan Oyunu
         </h1>
         <p className="text-gray-300 text-sm">
-          BFS Pathfinding Algoritması ile Akıllı Yol Bulma
+          BFS Pathfinding + Catmull-Rom Spline - Profesyonel Grafik
         </p>
       </div>
-
-      {/* ÜST BİLGİ KUTULARI KALDIRILDI - State'ler arka planda çalışmaya devam ediyor */}
 
       {/* HIZ KONTROL PANELİ */}
       <div className="mb-4 bg-gradient-to-r from-purple-600 via-purple-500 to-pink-500 p-1 rounded-xl shadow-2xl">
@@ -692,15 +778,15 @@ function App() {
             <span className="ml-2 font-bold text-yellow-400">{fps}</span>
           </div>
           <div>
-            <span className="text-gray-400">Algoritma:</span>
-            <span className="ml-2 font-bold text-green-400">BFS</span>
+            <span className="text-gray-400">Curve Res:</span>
+            <span className="ml-2 font-bold text-green-400">{CURVE_RESOLUTION}pts</span>
           </div>
         </div>
         <div className="mt-4 text-center text-gray-400 text-xs">
-          🧠 BFS (Breadth-First Search) algoritması ile yılan yeme giden en kısa yolu bulur
+          🧠 BFS pathfinding + Catmull-Rom spline ile profesyonel smooth animasyon
         </div>
         <div className="mt-2 text-center text-green-400 text-xs font-semibold">
-          ✨ Smooth animasyon: Oyun mantığı {fps} FPS, çizim 60 FPS
+          ✨ Tüp şeklinde tek parça gövde, tapering efekti, highlight ışığı
         </div>
         <div className="mt-2 text-center text-orange-400 text-xs">
           💥 Duvara veya kendi gövdesine çarparsa otomatik yeniden başlar
